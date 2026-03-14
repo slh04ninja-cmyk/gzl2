@@ -128,27 +128,27 @@ input int    MaxDailyTrades   = 2;
 input int    MaxSpread        = 50;   // Augmente pour backtesting
 
 //--------------------------------------------------------------------
-// SILVER BULLET WINDOWS (GMT+2)
+// SILVER BULLET WINDOWS
+// Meme logique que EMA_ADX_Scalper_EA :
+// TimeCurrent() = heure serveur broker (GMT+2 Exness)
+// Les heures ci-dessous sont en heure BROKER (GMT+2)
+// Maroc GMT+0 : ajouter 2h pour avoir l heure broker
+// Ex: tu es 08h00 Maroc = 10h00 broker GMT+2
 //--------------------------------------------------------------------
-//--------------------------------------------------------------------
-// SILVER BULLET WINDOWS - en heure GMT pure
-// Maroc = GMT+0 donc ces heures = tes heures locales
-//--------------------------------------------------------------------
-input group "=== WINDOW 1 : NY 03:00 = GMT 08:00 ==="
-input int    GMT_Offset   = 0;     // GMT pur (0 = Maroc, universel)
-input bool   UseWindow1   = true;
-input int    W1_Start     = 800;   // 08:00 GMT
-input int    W1_End       = 900;   // 09:00 GMT
+input group "=== WINDOW 1 : NY 03:00 (Broker 10h-11h) ==="
+input bool   UseWindow1    = true;
+input int    W1_StartHour  = 10;   // Heure debut broker GMT+2
+input int    W1_EndHour    = 11;   // Heure fin   broker GMT+2
 
-input group "=== WINDOW 2 : NY 10:00 = GMT 15:00 ==="
-input bool   UseWindow2   = true;
-input int    W2_Start     = 1500;  // 15:00 GMT
-input int    W2_End       = 1600;  // 16:00 GMT
+input group "=== WINDOW 2 : NY 10:00 (Broker 17h-18h) ==="
+input bool   UseWindow2    = true;
+input int    W2_StartHour  = 17;
+input int    W2_EndHour    = 18;
 
-input group "=== WINDOW 3 : NY 14:00 = GMT 19:00 ==="
-input bool   UseWindow3   = false;
-input int    W3_Start     = 1900;  // 19:00 GMT
-input int    W3_End       = 2000;  // 20:00 GMT
+input group "=== WINDOW 3 : NY 14:00 (Broker 21h-22h) ==="
+input bool   UseWindow3    = false;
+input int    W3_StartHour  = 21;
+input int    W3_EndHour    = 22;
 
 input group "=== FILTRE JOURS ==="
 input bool   TradeLundi    = true;
@@ -156,7 +156,7 @@ input bool   TradeMardi    = true;
 input bool   TradeMercredi = true;
 input bool   TradeJeudi    = true;
 input bool   TradeVendredi = false;
-input int    VendrediStop  = 1600;
+input int    VendrediStop  = 19;   // Heure broker limite vendredi
 
 //+------------------------------------------------------------------+
 //| STRUCTURES                                                       |
@@ -807,53 +807,55 @@ void CleanClosedTrades()
 //+------------------------------------------------------------------+
 bool IsTradingDayAllowed()
 {
-   // Utiliser TimeGMT pour etre independant du serveur broker
+   // Identique logique EMA_ADX_Scalper_EA v1.6
    MqlDateTime dt;
-   TimeToStruct(TimeGMT(), dt);
-   int t = dt.hour * 100 + dt.min;
-   switch(dt.day_of_week) {
+   TimeToStruct(TimeCurrent(), dt);
+   int h = dt.hour;
+   switch(dt.day_of_week)
+     {
       case 1: return TradeLundi;
       case 2: return TradeMardi;
       case 3: return TradeMercredi;
       case 4: return TradeJeudi;
-      case 5: return (TradeVendredi && t < VendrediStop);
+      case 5: return (TradeVendredi && h < VendrediStop);
       default: return false;
-   }
+     }
 }
 
 bool IsSilverBulletWindow()
 {
    if(!IsTradingDayAllowed()) return false;
+
+   // Identique logique EMA_ADX_Scalper_EA v1.6
    MqlDateTime dt;
-   // TimeGMT() + offset = heure de reference pure
-   // GMT_Offset = 0 pour Maroc/GMT universel
-   // GMT_Offset = 2 si tu veux utiliser heure serveur Exness
-   TimeToStruct(TimeGMT() + GMT_Offset * 3600, dt);
-   int t = dt.hour * 100 + dt.min;
-   bool w1 = UseWindow1 && (t >= W1_Start && t < W1_End);
-   bool w2 = UseWindow2 && (t >= W2_Start && t < W2_End);
-   bool w3 = UseWindow3 && (t >= W3_Start && t < W3_End);
+   TimeToStruct(TimeCurrent(), dt);
+   int h = dt.hour;
+
+   bool w1 = UseWindow1 && (h >= W1_StartHour && h < W1_EndHour);
+   bool w2 = UseWindow2 && (h >= W2_StartHour && h < W2_EndHour);
+   bool w3 = UseWindow3 && (h >= W3_StartHour && h < W3_EndHour);
    return (w1 || w2 || w3);
 }
 
 string GetWindowName()
 {
    MqlDateTime dt;
-   TimeToStruct(TimeGMT() + GMT_Offset * 3600, dt);
-   int t = dt.hour * 100 + dt.min;
-   if(UseWindow1 && t>=W1_Start && t<W1_End)
-      return StringFormat("W1 GMT %02d:%02d", W1_Start/100, W1_Start%100);
-   if(UseWindow2 && t>=W2_Start && t<W2_End)
-      return StringFormat("W2 GMT %02d:%02d", W2_Start/100, W2_Start%100);
-   if(UseWindow3 && t>=W3_Start && t<W3_End)
-      return StringFormat("W3 GMT %02d:%02d", W3_Start/100, W3_Start%100);
+   TimeToStruct(TimeCurrent(), dt);
+   int h = dt.hour;
+   if(UseWindow1 && h >= W1_StartHour && h < W1_EndHour)
+      return StringFormat("W1 %02dh-%02dh", W1_StartHour, W1_EndHour);
+   if(UseWindow2 && h >= W2_StartHour && h < W2_EndHour)
+      return StringFormat("W2 %02dh-%02dh", W2_StartHour, W2_EndHour);
+   if(UseWindow3 && h >= W3_StartHour && h < W3_EndHour)
+      return StringFormat("W3 %02dh-%02dh", W3_StartHour, W3_EndHour);
    return "Hors fenetre";
 }
 
 string GetDayName()
 {
-   MqlDateTime dt; TimeToStruct(TimeGMT(), dt);
-   string d[]={"Dim","Lun","Mar","Mer","Jeu","Ven","Sam"};
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string d[] = {"Dim","Lun","Mar","Mer","Jeu","Ven","Sam"};
    return d[dt.day_of_week];
 }
 
@@ -874,8 +876,8 @@ bool IsSpreadTooHigh()
 
 void ResetDailyCounter()
 {
-   // Utiliser TimeGMT pour le reset journalier
-   MqlDateTime dt; TimeToStruct(TimeGMT(), dt);
+   // Identique logique EMA_ADX_Scalper_EA
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    datetime today = StringToTime(
       StringFormat("%04d.%02d.%02d 00:00", dt.year, dt.mon, dt.day));
    if(g_LastDay != today) {
@@ -922,9 +924,9 @@ void PrintConfig()
    Print("=== Silver Bullet ICT EA v4.2 ===");
    Print("=== Heure GMT pure (Maroc GMT+0) ===");
    Print(StringFormat("GMT_Offset : %d", GMT_Offset));
-   Print(StringFormat("W1 : %s  GMT %04d-%04d", UseWindow1?"ON":"OFF", W1_Start, W1_End));
-   Print(StringFormat("W2 : %s  GMT %04d-%04d", UseWindow2?"ON":"OFF", W2_Start, W2_End));
-   Print(StringFormat("W3 : %s  GMT %04d-%04d", UseWindow3?"ON":"OFF", W3_Start, W3_End));
+   Print(StringFormat("W1 : %s  Broker %02dh-%02dh", UseWindow1?"ON":"OFF", W1_StartHour, W1_EndHour));
+   Print(StringFormat("W2 : %s  Broker %02dh-%02dh", UseWindow2?"ON":"OFF", W2_StartHour, W2_EndHour));
+   Print(StringFormat("W3 : %s  Broker %02dh-%02dh", UseWindow3?"ON":"OFF", W3_StartHour, W3_EndHour));
    Print(StringFormat("Methode : %s", UseBiasEMA ? "EMA" : "Structure ICT"));
    Print(StringFormat("Macro   : %s (%s)", UseMacroFilter ? "ON" : "OFF", TFtoStr(MacroTF)));
    Print(StringFormat("Biais   : %s EMA%d/EMA%d BOS:%s", TFtoStr(BiaisTF),
@@ -940,7 +942,7 @@ void PrintConfig()
 
 void UpdateComment()
 {
-   MqlDateTime dtGMT; TimeToStruct(TimeGMT(), dtGMT);
+   MqlDateTime dtGMT; TimeToStruct(TimeCurrent(), dtGMT);
    string gmtTime = StringFormat("GMT %02d:%02d", dtGMT.hour, dtGMT.min);
    string macro  = !UseMacroFilter ? "OFF"
                  : g_MacroBias > 0 ? "BULL" : g_MacroBias < 0 ? "BEAR" : "NEUT";
