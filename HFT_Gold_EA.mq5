@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
 //|                                           HFT_Gold_EA.mq5        |
-//|                    Expert Advisor HFT — Version 1.6              |
+//|                    Expert Advisor HFT — Version 1.61              |
 //|          TEST MINIMAL — Un trade par bougie sans filtre          |
 //+------------------------------------------------------------------+
 #property copyright "HFT_Gold_EA v1.6"
