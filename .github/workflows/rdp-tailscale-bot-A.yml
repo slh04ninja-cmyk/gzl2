@@ -310,7 +310,7 @@ jobs:
           $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
           $files   = @(
             "Quantum_Scalper_Pro.mq5",
-            "SMC_Gold_Scalper.mq5",
+            "HFT_Gold_EA.mq5",
             "EMA_ADX_Scalper_EA_v2.mq5",
             "SilverBullet_ICT_EA_v4.2.mq5"
           )
