@@ -311,7 +311,10 @@ jobs:
           $files   = @(
             "Quantum_Scalper_Pro.mq5",
             "HFT_Gold_EA.mq5",
-            "HTF_Gold_EA_v2.6.mq5",
+            "HTF_Gold_EA_v2.8.mq5",
+            "HTF_Gold_EA_v2.9.mq5",
+            "HTF_Gold_EA_v3.0.mq5",
+            "HTF_Gold_EA_v3.1.mq5",
             "EMA_ADX_Scalper_EA_v2.mq5",
             "SilverBullet_ICT_EA_v4.2.mq5"
           )
