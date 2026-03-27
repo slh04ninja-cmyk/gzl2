@@ -1,11 +1,13 @@
 //+------------------------------------------------------------------+
 //|                                            HTF_Gold_EA_v3.0.mq5 |
-//|          MER — Couche 1+2+3 : VSP + MSB + Volume Pressure                  |
-//|               Couche 3 : Volume Pressure (VP)            |
+//|          MER — Couche 1 : Velocity Spike (VSP)                  |
+//|               Couche 2 : Micro Structure Break (MSB)            |
 //|          H1 Bias : EMA OU Double SuperTrend                     |
 //|          SL/TP  : ATR OU Points (liste déroulante)              |
+//|          SL     : Structure Swing + ATR (Stoploss Areas)        |
+//|          LOT    : Fixe OU % Risque du capital                   |
 //+------------------------------------------------------------------+
-#property copyright "HTF Gold EA v3.0 - MER Layer 1+2+3"
+#property copyright "HTF Gold EA v3.0 - MER Layer 1+2 + StoplosAreas + Risk%"
 #property version   "3.00"
 #property strict
 
@@ -40,6 +42,12 @@ enum ENUM_MSB_TIMING
    MSB_TIMING_AFTER  = 1  // MSB après le spike
 };
 
+enum ENUM_LOT_MODE
+{
+   LOT_MODE_FIXED   = 0,  // Lot fixe
+   LOT_MODE_PERCENT = 1   // % du capital (risque par trade)
+};
+
 //+------------------------------------------------------------------+
 //| INPUTS                                                           |
 //+------------------------------------------------------------------+
@@ -53,14 +61,14 @@ input int               InpH1_EMA_Slow      = 80;           // [EMA] Période Sl
 input bool              InpH1_ConfirmH1Bar  = false;          // [EMA] Confirmer biais : prix actuel vs Open H1[0]
 input int               InpST1_Period       = 5;            // [ST1] Période ATR
 input double            InpST1_Multiplier   = 0.4;           // [ST1] Multiplicateur
-input int               InpST2_Period       = 14;            // [ST2] Période ATR
+input int               InpST2_Period       = 13;                   // [ST2] Période ATR
 input double            InpST2_Multiplier   = 1.3;           // [ST2] Multiplicateur
 
 input group "=== COUCHE 1 : VELOCITY SPIKE (VSP) ==="
 input int               InpVSP_ATR_Period   = 17;            // ATR Period pour spike
 input double            InpVSP_Spike_Multi  = 1.6;           // Corps bougie > X * ATR = Spike
 input bool              InpVSP_NeedConfirm  = true;          // Attendre bougie confirmation
-input int               InpVSP_LookBack     = 7;             // Chercher spike dans X bougies passées
+input int               InpVSP_LookBack     = 9;                    // Chercher spike dans X bougies passées
 
 input group "=== COUCHE 2 : MICRO STRUCTURE BREAK (MSB) ==="
 input bool              InpUseMSB           = true;          // Activer Couche 2 MSB
@@ -68,37 +76,38 @@ input int               InpMSB_SwingBars    = 16;             // Bougies pour d�
 input ENUM_MSB_BREAK    InpMSB_BreakType    = MSB_BREAK_CLOSE; // Condition de cassure
 input ENUM_MSB_TIMING   InpMSB_Timing       = MSB_TIMING_BEFORE; // MSB avant ou après le spike
 
-input group "=== COUCHE 3 : VOLUME PRESSURE (VP) ==="
-input bool              InpUseVP            = true;          // Activer Couche 3 Volume Pressure
-input int               InpVP_LookBack      = 10;            // Bougies pour calculer volume moyen
-input double            InpVP_Multi         = 1.5;           // Volume spike > moyenne × X
-
 input group "=== MODE SL/TP ==="
 input ENUM_SLTP_MODE    InpSLTP_Mode        = SLTP_MODE_ATR; // Mode calcul SL/TP
 
 // --- Sous-groupe ATR
-input int               InpATR_SL_Period    = 17;            // [ATR] Période ATR pour SL
-input double            InpATR_SL_Multi     = 1.7;           // [ATR] Multiplicateur SL
-input double            InpRR_Ratio         = 2.2;           // [ATR/PTS] Risk:Reward TP
+input int               InpATR_SL_Period    = 16;                   // [ATR] Période ATR pour SL
+input double            InpATR_SL_Multi     = 1.6;                  // [ATR] Multiplicateur SL
+input double            InpRR_Ratio         = 2.0;                  // [ATR/PTS] Risk:Reward TP
 
 // --- Sous-groupe Points
 // XAUUSDm : 1 point = 0.01$ sur 0.01 lot → 1000 pts = 10$
 input int               InpSL_Points        = 5000;          // [PTS] SL en points (5000 pts = 5$)
 input int               InpTP_Points        = 7500;          // [PTS] TP en points (7500 pts = 7.5$)
 
+input group "=== GESTION DU LOT ==="
+input ENUM_LOT_MODE     InpLotMode          = LOT_MODE_FIXED;       // Mode lot (Fixe / % Risque)
+input double            InpLotSize          = 0.01;                 // [FIXE] Lot fixe
+input double            InpRiskPercent      = 1.0;                  // [%] Risque par trade (% capital)
+input double            InpLotMin           = 0.01;                 // [%] Lot minimum autorisé
+input double            InpLotMax           = 1.00;                 // [%] Lot maximum autorisé
+
 input group "=== TRADE MANAGEMENT ==="
-input double            InpLotSize          = 0.01;          // Lot fixe
-input int               InpMaxTrades        = 3;             // Max trades simultanés
-input int               InpMagicNumber      = 202602;        // Magic Number
-input int               InpSlippage         = 10;            // Slippage (points)
+input int               InpMaxTrades        = 3;                    // Max trades simultanés
+input int               InpMagicNumber      = 202602;               // Magic Number
+input int               InpSlippage         = 10;                   // Slippage (points)
 
 input group "=== BREAKEVEN ==="
 input bool              InpUseBreakeven     = true;         // Activer Breakeven
-input double            InpBE_Trigger_RR    = 0.8;           // Déclencher BE à X * TP dist
+input double            InpBE_Trigger_RR    = 1.0;                  // Déclencher BE à X * TP dist
 
 input group "=== FERMETURE PAR TEMPS ==="
 input bool              InpUseTimeClose     = true;          // Activer fermeture par temps
-input int               InpMaxMinutes       = 33;            // Fermer après X minutes
+input int               InpMaxMinutes       = 30;                   // Fermer après X minutes
 
 input group "=== FILTRE HORAIRE ==="
 input bool              InpUseTimeFilter    = true;          // Filtre horaire actif
@@ -106,7 +115,7 @@ input bool              InpUseWindow1       = true;          // Fenêtre 1 activ
 input int               InpW1_Start         = 7;             // [W1] Heure début London
 input int               InpW1_End           = 12;            // [W1] Heure fin London (exclu)
 input bool              InpUseWindow2       = true;          // Fenêtre 2 active (NY)
-input int               InpW2_Start         = 14;            // [W2] Heure début NY (exclu 12h)
+input int               InpW2_Start         = 14;                   // [W2] Heure début NY
 input int               InpW2_End           = 20;            // [W2] Heure fin NY (exclu)
 
 //+------------------------------------------------------------------+
@@ -139,14 +148,15 @@ struct MSB_Result
 //+------------------------------------------------------------------+
 CTrade         trade;
 CPositionInfo  posInfo;
-string         symbol;
-int            digits;
-double         point;
+string         g_symbol;
+int            g_digits;
+double         g_point;
 
 int            h1_ema_fast_handle  = INVALID_HANDLE;
 int            h1_ema_slow_handle  = INVALID_HANDLE;
 int            m1_atr_sl_handle    = INVALID_HANDLE;
 int            m1_atr_vsp_handle   = INVALID_HANDLE;
+int            m1_atr_str_handle   = INVALID_HANDLE; // ATR pour Structure SL
 
 double         h1_ema_fast[];
 double         h1_ema_slow[];
@@ -158,24 +168,26 @@ double         m1_atr_vsp[];
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   symbol = (InpSymbol == "") ? _Symbol : InpSymbol;
-   digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
-   point  = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   g_symbol = (InpSymbol == "") ? _Symbol : InpSymbol;
+   g_digits = (int)SymbolInfoInteger(g_symbol, SYMBOL_DIGITS);
+   g_point  = SymbolInfoDouble(g_symbol, SYMBOL_POINT);
 
    trade.SetExpertMagicNumber(InpMagicNumber);
    trade.SetDeviationInPoints(InpSlippage);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
    // H1 EMA
-   h1_ema_fast_handle = iMA(symbol, PERIOD_H1, InpH1_EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
-   h1_ema_slow_handle = iMA(symbol, PERIOD_H1, InpH1_EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   h1_ema_fast_handle = iMA(g_symbol, PERIOD_H1, InpH1_EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
+   h1_ema_slow_handle = iMA(g_symbol, PERIOD_H1, InpH1_EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
 
    // M1 ATR handles
-   m1_atr_sl_handle  = iATR(symbol, PERIOD_M1, InpATR_SL_Period);
-   m1_atr_vsp_handle = iATR(symbol, PERIOD_M1, InpVSP_ATR_Period);
+   m1_atr_sl_handle  = iATR(g_symbol, PERIOD_M1, InpATR_SL_Period);
+   m1_atr_vsp_handle = iATR(g_symbol, PERIOD_M1, InpVSP_ATR_Period);
+   m1_atr_str_handle = iATR(g_symbol, PERIOD_M1, InpStructure_ATR);
 
    if(h1_ema_fast_handle == INVALID_HANDLE || h1_ema_slow_handle == INVALID_HANDLE ||
-      m1_atr_sl_handle   == INVALID_HANDLE || m1_atr_vsp_handle  == INVALID_HANDLE)
+      m1_atr_sl_handle   == INVALID_HANDLE || m1_atr_vsp_handle  == INVALID_HANDLE ||
+      m1_atr_str_handle  == INVALID_HANDLE)
    {
       Print("ERREUR: Création handles échouée.");
       return INIT_FAILED;
@@ -199,14 +211,12 @@ int OnInit()
                                   InpSL_Points, InpSL_Points * InpLotSize * 0.1,
                                   InpTP_Points, InpTP_Points * InpLotSize * 0.1);
 
-   PrintFormat("HTF Gold EA v3.0 [MER-L1+L2+L3] | %s | H1: %s%s | SL/TP: %s | MSB: %s | VP: %s",
-               symbol, filterName,
+   PrintFormat("HTF Gold EA v2.9 [MER-L1+L2] | %s | H1: %s%s | SL/TP: %s | MSB: %s",
+               g_symbol, filterName,
                (InpH1FilterType==H1_FILTER_EMA && InpH1_ConfirmH1Bar) ? "+ConfirmH1[0]" : "",
                sltpName,
-               InpUseMSB ? StringFormat("ON Bars=%d Break=%d %s",
-                           InpMSB_SwingBars, InpMSB_BreakType,
-                           InpMSB_Timing==MSB_TIMING_BEFORE?"BEFORE":"AFTER") : "OFF",
-               InpUseVP ? StringFormat("ON LB=%d Multi=%.1f", InpVP_LookBack, InpVP_Multi) : "OFF");
+               InpUseMSB ? StringFormat("ON SwingBars=%d Break=%d Timing=%d",
+                           InpMSB_SwingBars, InpMSB_BreakType, InpMSB_Timing) : "OFF");
    return INIT_SUCCEEDED;
 }
 
@@ -219,6 +229,7 @@ void OnDeinit(const int reason)
    IndicatorRelease(h1_ema_slow_handle);
    IndicatorRelease(m1_atr_sl_handle);
    IndicatorRelease(m1_atr_vsp_handle);
+   IndicatorRelease(m1_atr_str_handle);
 }
 
 //+------------------------------------------------------------------+
@@ -228,7 +239,7 @@ void OnTick()
 {
    // Nouvelle bougie M1 seulement
    static datetime lastBar = 0;
-   datetime currentBar = iTime(symbol, PERIOD_M1, 0);
+   datetime currentBar = iTime(g_symbol, PERIOD_M1, 0);
    if(currentBar == lastBar) return;
    lastBar = currentBar;
 
@@ -275,8 +286,8 @@ void OnTick()
    // H1 Bearish → confirmation baissière (close < open)
    if(InpVSP_NeedConfirm)
    {
-      double closeC = iClose(symbol, PERIOD_M1, 1);
-      double openC  = iOpen(symbol,  PERIOD_M1, 1);
+      double closeC = iClose(g_symbol, PERIOD_M1, 1);
+      double openC  = iOpen(g_symbol,  PERIOD_M1, 1);
       if(signal ==  1 && closeC <= openC)
       {
          PrintFormat("[CONFIRM BLOQUÉ] H1=BULL confirmation baissière → BUY annulé");
@@ -305,21 +316,6 @@ void OnTick()
       PrintFormat("[MSB OK] Swing=%.3f cassé à bar[%d]", msb.swingLevel, msb.barIndex);
    }
 
-   //=================================================================
-   // COUCHE 3 : VOLUME PRESSURE (VP)
-   // Le volume de la bougie spike doit être supérieur
-   // à la moyenne des X dernières bougies × multiplicateur
-   //=================================================================
-   if(InpUseVP)
-   {
-      if(!CheckVolumePressure(vsp.barIndex))
-      {
-         PrintFormat("[VP BLOQUÉ] Volume spike insuffisant → signal rejeté");
-         return;
-      }
-      PrintFormat("[VP OK] Volume spike validé");
-   }
-
    // Calcul SL/TP selon mode
    double slDist = 0, tpDist = 0;
 
@@ -332,32 +328,83 @@ void OnTick()
    }
    else // SLTP_MODE_POINTS
    {
-      // XAUUSDm : 1 point = symbole point
-      // 1000 pts × 0.01 lot = 10$  →  1 pt = 0.001$ / lot
-      slDist = InpSL_Points * point;
-      tpDist = InpTP_Points * point;
+      slDist = InpSL_Points * g_point;
+      tpDist = InpTP_Points * g_point;
    }
 
-   double ask = SymbolInfoDouble(symbol, SYMBOL_ASK);
-   double bid = SymbolInfoDouble(symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+
+   // Calculer le lot selon le mode choisi
+   double lotSize = CalcLotSize(slDist);
 
    if(signal == 1 && !HasOpenTrade(POSITION_TYPE_BUY))
    {
-      double sl = NormalizeDouble(ask - slDist, digits);
-      double tp = NormalizeDouble(ask + tpDist, digits);
-      if(trade.Buy(InpLotSize, symbol, ask, sl, tp,
-                   StringFormat("MER-L1|BUY|%s|spike@%d",
-                                (InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"), vsp.barIndex)))
-         PrintSignal("BUY", ask, sl, tp, slDist, tpDist, vsp);
+      double sl, tp;
+
+      if(InpUseStructureSL)
+      {
+         // SL basé sur Structure : lowest(low, LB) - ATR × Multi
+         double strSL = CalcStructureSL(1);
+         if(strSL <= 0) strSL = ask - slDist; // fallback ATR
+         sl = NormalizeDouble(strSL, g_digits);
+         // TP basé sur distance SL réelle × RR
+         double realSlDist = ask - sl;
+         double realTpDist = realSlDist * InpRR_Ratio;
+         // Appliquer limite TP maximum si activée
+         if(InpTP_MaxPoints > 0)
+            realTpDist = MathMin(realTpDist, InpTP_MaxPoints * g_point);
+         tp = NormalizeDouble(ask + realTpDist, g_digits);
+         // Recalculer lot avec SL réel
+         lotSize = CalcLotSize(realSlDist);
+         PrintFormat("[StructureSL] BUY SL=%.3f (dist=%.1f pts) TP=%.3f (dist=%.1f pts) RR=%.1f",
+                     sl, realSlDist/g_point, tp, realTpDist/g_point, InpRR_Ratio);
+      }
+      else
+      {
+         sl = NormalizeDouble(ask - slDist, g_digits);
+         tp = NormalizeDouble(ask + tpDist, g_digits);
+      }
+
+      if(trade.Buy(lotSize, g_symbol, ask, sl, tp,
+                   StringFormat("HTF-v3|BUY|%s|lot=%.2f|spike@%d",
+                                InpUseStructureSL?"STR":(InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"),
+                                lotSize, vsp.barIndex)))
+         PrintSignal("BUY", ask, sl, tp, MathAbs(ask-sl), MathAbs(tp-ask), vsp);
    }
    else if(signal == -1 && !HasOpenTrade(POSITION_TYPE_SELL))
    {
-      double sl = NormalizeDouble(bid + slDist, digits);
-      double tp = NormalizeDouble(bid - tpDist, digits);
-      if(trade.Sell(InpLotSize, symbol, bid, sl, tp,
-                    StringFormat("MER-L1|SELL|%s|spike@%d",
-                                 (InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"), vsp.barIndex)))
-         PrintSignal("SELL", bid, sl, tp, slDist, tpDist, vsp);
+      double sl, tp;
+
+      if(InpUseStructureSL)
+      {
+         // SL basé sur Structure : highest(high, LB) + ATR × Multi
+         double strSL = CalcStructureSL(-1);
+         if(strSL <= 0) strSL = bid + slDist; // fallback ATR
+         sl = NormalizeDouble(strSL, g_digits);
+         // TP basé sur distance SL réelle × RR
+         double realSlDist = sl - bid;
+         double realTpDist = realSlDist * InpRR_Ratio;
+         // Appliquer limite TP maximum si activée
+         if(InpTP_MaxPoints > 0)
+            realTpDist = MathMin(realTpDist, InpTP_MaxPoints * g_point);
+         tp = NormalizeDouble(bid - realTpDist, g_digits);
+         // Recalculer lot avec SL réel
+         lotSize = CalcLotSize(realSlDist);
+         PrintFormat("[StructureSL] SELL SL=%.3f (dist=%.1f pts) TP=%.3f (dist=%.1f pts) RR=%.1f",
+                     sl, realSlDist/g_point, tp, realTpDist/g_point, InpRR_Ratio);
+      }
+      else
+      {
+         sl = NormalizeDouble(bid + slDist, g_digits);
+         tp = NormalizeDouble(bid - tpDist, g_digits);
+      }
+
+      if(trade.Sell(lotSize, g_symbol, bid, sl, tp,
+                    StringFormat("HTF-v3|SELL|%s|lot=%.2f|spike@%d",
+                                 InpUseStructureSL?"STR":(InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"),
+                                 lotSize, vsp.barIndex)))
+         PrintSignal("SELL", bid, sl, tp, MathAbs(bid-sl), MathAbs(bid-tp), vsp);
    }
 }
 
@@ -377,8 +424,8 @@ VSP_Result DetectVelocitySpike()
    ArraySetAsSeries(open,  true);
    ArraySetAsSeries(close, true);
 
-   if(CopyOpen(symbol,  PERIOD_M1, 0, barsToCheck, open)  < barsToCheck) return result;
-   if(CopyClose(symbol, PERIOD_M1, 0, barsToCheck, close) < barsToCheck) return result;
+   if(CopyOpen(g_symbol,  PERIOD_M1, 0, barsToCheck, open)  < barsToCheck) return result;
+   if(CopyClose(g_symbol, PERIOD_M1, 0, barsToCheck, close) < barsToCheck) return result;
 
    for(int i = 2; i <= InpVSP_LookBack + 1; i++)
    {
@@ -395,49 +442,6 @@ VSP_Result DetectVelocitySpike()
       }
    }
    return result;
-}
-
-//+------------------------------------------------------------------+
-//| COUCHE 3 — VOLUME PRESSURE (VP)                                 |
-//|                                                                  |
-//| Vérifie que le volume de la bougie spike est significatif       |
-//| Volume spike > moyenne(InpVP_LookBack bougies) × InpVP_Multi   |
-//|                                                                  |
-//| Note : sur XAUUSDm MT5 le "volume" = tick count par bougie     |
-//| C'est un proxy fiable de l'activité réelle sur M1              |
-//+------------------------------------------------------------------+
-bool CheckVolumePressure(int spikeBarIndex)
-{
-   int totalBars = spikeBarIndex + InpVP_LookBack + 2;
-
-   long volBuf[];
-   ArraySetAsSeries(volBuf, true);
-   if(CopyTickVolume(symbol, PERIOD_M1, 0, totalBars, volBuf) < totalBars)
-      return true; // Si données indisponibles → ne pas bloquer
-
-   // Volume de la bougie spike
-   long spikeVol = volBuf[spikeBarIndex];
-   if(spikeVol <= 0) return true;
-
-   // Calculer la moyenne des X bougies AVANT le spike
-   int refStart = spikeBarIndex + 1;
-   int refEnd   = spikeBarIndex + InpVP_LookBack;
-   if(refEnd >= totalBars) return true;
-
-   double sumVol = 0;
-   for(int i = refStart; i <= refEnd; i++)
-      sumVol += (double)volBuf[i];
-
-   double avgVol = sumVol / InpVP_LookBack;
-   if(avgVol <= 0) return true;
-
-   double ratio = (double)spikeVol / avgVol;
-
-   PrintFormat("[VP] SpikeVol=%d AvgVol=%.1f Ratio=%.2f Seuil=%.1f → %s",
-               spikeVol, avgVol, ratio, InpVP_Multi,
-               ratio >= InpVP_Multi ? "ACCEPTÉ ✅" : "REJETÉ ❌");
-
-   return (ratio >= InpVP_Multi);
 }
 
 //+------------------------------------------------------------------+
@@ -474,10 +478,10 @@ MSB_Result DetectMSB(int signal, int spikeBarIndex)
    ArraySetAsSeries(closeBuf, true);
    ArraySetAsSeries(openBuf,  true);
 
-   if(CopyHigh (symbol, PERIOD_M1, 0, totalBars, highBuf)  < totalBars) return result;
-   if(CopyLow  (symbol, PERIOD_M1, 0, totalBars, lowBuf)   < totalBars) return result;
-   if(CopyClose(symbol, PERIOD_M1, 0, totalBars, closeBuf) < totalBars) return result;
-   if(CopyOpen (symbol, PERIOD_M1, 0, totalBars, openBuf)  < totalBars) return result;
+   if(CopyHigh (g_symbol, PERIOD_M1, 0, totalBars, highBuf)  < totalBars) return result;
+   if(CopyLow  (g_symbol, PERIOD_M1, 0, totalBars, lowBuf)   < totalBars) return result;
+   if(CopyClose(g_symbol, PERIOD_M1, 0, totalBars, closeBuf) < totalBars) return result;
+   if(CopyOpen (g_symbol, PERIOD_M1, 0, totalBars, openBuf)  < totalBars) return result;
 
    // Définir la zone de recherche selon le timing
    // bar[0] = en cours, bar[1] = dernière fermée
@@ -625,8 +629,8 @@ int GetH1Bias_EMA()
    // Condition 2 : confirmation par prix actuel vs Open H1[0] — optionnelle
    if(InpH1_ConfirmH1Bar)
    {
-      double currentBid = SymbolInfoDouble(symbol, SYMBOL_BID);
-      double openH1     = iOpen(symbol, PERIOD_H1, 0);
+      double currentBid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
+      double openH1     = iOpen(g_symbol, PERIOD_H1, 0);
       if(openH1 <= 0) return 0;
 
       // BULL confirmé uniquement si prix actuel > Open H1[0]
@@ -659,7 +663,7 @@ SuperTrendData CalcSuperTrend(ENUM_TIMEFRAMES tf, int period, double multiplier,
    SuperTrendData result;
    result.direction = 0; result.upper = 0; result.lower = 0;
 
-   int atrH = iATR(symbol, tf, period);
+   int atrH = iATR(g_symbol, tf, period);
    if(atrH == INVALID_HANDLE) return result;
 
    double atrBuf[], highBuf[], lowBuf[], closeBuf[];
@@ -669,9 +673,9 @@ SuperTrendData CalcSuperTrend(ENUM_TIMEFRAMES tf, int period, double multiplier,
    ArraySetAsSeries(closeBuf, true);
 
    if(CopyBuffer(atrH,  0, 0, bars, atrBuf)   < bars ||
-      CopyHigh(symbol,  tf, 0, bars, highBuf)  < bars ||
-      CopyLow(symbol,   tf, 0, bars, lowBuf)   < bars ||
-      CopyClose(symbol, tf, 0, bars, closeBuf) < bars)
+      CopyHigh(g_symbol,  tf, 0, bars, highBuf)  < bars ||
+      CopyLow(g_symbol,   tf, 0, bars, lowBuf)   < bars ||
+      CopyClose(g_symbol, tf, 0, bars, closeBuf) < bars)
    { IndicatorRelease(atrH); return result; }
 
    IndicatorRelease(atrH);
@@ -717,7 +721,7 @@ void CheckTimeClose()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Symbol() != symbol || posInfo.Magic() != InpMagicNumber) continue;
+      if(posInfo.Symbol() != g_symbol || posInfo.Magic() != InpMagicNumber) continue;
 
       datetime openTime = posInfo.Time();
       int minutesOpen   = (int)((now - openTime) / 60);
@@ -725,8 +729,8 @@ void CheckTimeClose()
       if(minutesOpen >= InpMaxMinutes)
       {
          double closePrice = (posInfo.PositionType() == POSITION_TYPE_BUY)
-                             ? SymbolInfoDouble(symbol, SYMBOL_BID)
-                             : SymbolInfoDouble(symbol, SYMBOL_ASK);
+                             ? SymbolInfoDouble(g_symbol, SYMBOL_BID)
+                             : SymbolInfoDouble(g_symbol, SYMBOL_ASK);
 
          if(trade.PositionClose(posInfo.Ticket(), InpSlippage))
             PrintFormat("[TIME CLOSE] #%d fermé après %d min | P&L=%.2f$",
@@ -746,7 +750,7 @@ void CheckBreakeven()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Symbol() != symbol || posInfo.Magic() != InpMagicNumber) continue;
+      if(posInfo.Symbol() != g_symbol || posInfo.Magic() != InpMagicNumber) continue;
 
       double open    = posInfo.PriceOpen();
       double sl      = posInfo.StopLoss();
@@ -779,7 +783,7 @@ int CountOpenTrades()
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Symbol() == symbol && posInfo.Magic() == InpMagicNumber) count++;
+      if(posInfo.Symbol() == g_symbol && posInfo.Magic() == InpMagicNumber) count++;
    }
    return count;
 }
@@ -789,7 +793,7 @@ bool HasOpenTrade(ENUM_POSITION_TYPE posType)
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Symbol() != symbol || posInfo.Magic() != InpMagicNumber) continue;
+      if(posInfo.Symbol() != g_symbol || posInfo.Magic() != InpMagicNumber) continue;
       if(posInfo.PositionType() == posType) return true;
    }
    return false;
@@ -804,7 +808,7 @@ bool IsTradeHour()
    // Fenêtre 1 : London  (défaut 07:00 → 11:59)
    bool inW1 = InpUseWindow1 && (h >= InpW1_Start && h < InpW1_End);
 
-   // Fenêtre 2 : NY      (défaut 13:00 → 19:59) — heure 12 exclue
+   // Fenêtre 2 : NY      (défaut 14:00 → 19:59)
    bool inW2 = InpUseWindow2 && (h >= InpW2_Start && h < InpW2_End);
 
    return (inW1 || inW2);
@@ -813,15 +817,105 @@ bool IsTradeHour()
 void PrintSignal(string dir, double price, double sl, double tp,
                  double slDist, double tpDist, VSP_Result &vsp)
 {
-   double slPts   = slDist / point;
-   double tpPts   = tpDist / point;
-   // Calcul $ pour XAUUSDm : 1000 pts × 0.01 lot = 10$
-   // Formule correcte XAUUSDm : Profit = Lots × 100 × Points × 0.001 = Lots × Points × 0.1
-   double slUSD   = slPts * InpLotSize * 0.1;
-   double tpUSD   = tpPts * InpLotSize * 0.1;
+   double slPts   = slDist / g_point;
+   double tpPts   = tpDist / g_point;
+   double lotUsed = (InpLotMode == LOT_MODE_FIXED) ? InpLotSize : CalcLotSize(slDist);
+   double slUSD   = slPts * lotUsed * 0.1;
+   double tpUSD   = tpPts * lotUsed * 0.1;
    string mode    = (InpSLTP_Mode == SLTP_MODE_ATR) ? "ATR" : "PTS";
+   string lotMode = (InpLotMode == LOT_MODE_FIXED) ? "FIXE" : StringFormat("%.1f%%", InpRiskPercent);
 
-   PrintFormat("[MER-L1][%s] %s @ %.5f | SL=%.5f (%.0f pts / %.2f$) | TP=%.5f (%.0f pts / %.2f$) | SpikeBar=%d",
-               mode, dir, price, sl, slPts, slUSD, tp, tpPts, tpUSD, vsp.barIndex);
+   PrintFormat("[MER-L1][%s][LOT:%s=%.2f] %s @ %.5f | SL=%.5f(%.0fpts/%.2f$) | TP=%.5f(%.0fpts/%.2f$) | Spike@%d",
+               mode, lotMode, lotUsed, dir, price,
+               sl, slPts, slUSD, tp, tpPts, tpUSD, vsp.barIndex);
+}
+
+//+------------------------------------------------------------------+
+//| STOPLOSS AREAS — Structure SL                                   |
+//|                                                                  |
+//| Inspiré de l'indicateur "Stoploss area's" par chadmex           |
+//| BUY  : longstop  = lowest(low,  LB) - ATR × Multi              |
+//| SELL : shortstop = highest(high, LB) + ATR × Multi             |
+//|                                                                  |
+//| Paramètres : ATR(14), Lookback(7), Multiplier(1.0)              |
+//+------------------------------------------------------------------+
+double CalcStructureSL(int direction)
+{
+   int barsNeeded = InpStructure_LB + 2;
+
+   double atrBuf[], highBuf[], lowBuf[];
+   ArraySetAsSeries(atrBuf,  true);
+   ArraySetAsSeries(highBuf, true);
+   ArraySetAsSeries(lowBuf,  true);
+
+   if(CopyBuffer(m1_atr_str_handle, 0, 0, barsNeeded, atrBuf)  < barsNeeded) return 0.0;
+   if(CopyHigh(g_symbol, PERIOD_M1, 0, barsNeeded, highBuf)    < barsNeeded) return 0.0;
+   if(CopyLow(g_symbol,  PERIOD_M1, 0, barsNeeded, lowBuf)     < barsNeeded) return 0.0;
+
+   double atr = atrBuf[1]; // barre M1 fermée
+   if(atr <= 0) return 0.0;
+
+   double realatr = atr * InpStructure_Multi;
+
+   if(direction == 1) // BUY → longstop = lowest(low, LB) - realatr
+   {
+      double lowestLow = lowBuf[1];
+      for(int i = 2; i <= InpStructure_LB; i++)
+         if(lowBuf[i] < lowestLow) lowestLow = lowBuf[i];
+
+      return lowestLow - realatr;
+   }
+   else // SELL → shortstop = highest(high, LB) + realatr
+   {
+      double highestHigh = highBuf[1];
+      for(int i = 2; i <= InpStructure_LB; i++)
+         if(highBuf[i] > highestHigh) highestHigh = highBuf[i];
+
+      return highestHigh + realatr;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| CALCUL LOT SELON MODE                                            |
+//| LOT_MODE_FIXED   : retourne InpLotSize                          |
+//| LOT_MODE_PERCENT : calcule le lot basé sur % du capital         |
+//|                                                                  |
+//| Formule XAUUSDm :                                               |
+//|   Risque$ = Capital × (RiskPercent / 100)                       |
+//|   Lot = Risque$ / (SL_points × 0.1)                            |
+//|   Exemple : Capital=300$, Risk=1%, SL=500pts                    |
+//|   Lot = (300×0.01) / (500×0.1) = 3 / 50 = 0.06                |
+//+------------------------------------------------------------------+
+double CalcLotSize(double slDist)
+{
+   if(InpLotMode == LOT_MODE_FIXED)
+      return InpLotSize;
+
+   // Calcul % risque
+   double capital   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double riskMoney = capital * (InpRiskPercent / 100.0);
+
+   // SL en points
+   double slPoints  = slDist / g_point;
+   if(slPoints <= 0) return InpLotMin;
+
+   // Valeur d'1 g_point pour 1 lot sur XAUUSDm = 0.1$
+   double pointValue = 0.1;
+
+   // Lot calculé
+   double lot = riskMoney / (slPoints * pointValue);
+
+   // Normaliser selon step du broker
+   double lotStep = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+   lot = MathFloor(lot / lotStep) * lotStep;
+
+   // Appliquer limites min/max
+   lot = MathMax(lot, InpLotMin);
+   lot = MathMin(lot, InpLotMax);
+
+   PrintFormat("[LOT%%] Capital=%.2f$ Risk=%.1f%%=%.2f$ SL=%.0fpts → Lot=%.2f",
+               capital, InpRiskPercent, riskMoney, slPoints, lot);
+
+   return lot;
 }
 //+------------------------------------------------------------------+
