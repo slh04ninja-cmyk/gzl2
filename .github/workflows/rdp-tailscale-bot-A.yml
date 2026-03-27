@@ -336,7 +336,30 @@ jobs:
           } catch {
             Write-Host "MT5 download ignore : $($_.Exception.Message)"
           }
-
+        
+      - name: Copy MQ5 files to Desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_REPO: ${{ inputs.bot_repo }}
+        run: |
+          $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+          $base    = "https://raw.githubusercontent.com/$env:BOT_REPO/main"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $files   = @(
+            "Quantum_Scalper_Pro.mq5",
+            "SMC_Gold_Scalper.mq5",
+            "EMA_ADX_Scalper_EA.mq5",
+            "SilverBullet_ICT_EA_v3.2.mq5"
+          )
+          foreach ($f in $files) {
+            try {
+              Invoke-WebRequest -Uri "$base/$f" -OutFile "$desktop\$f" -Headers $headers -ErrorAction Stop
+              Write-Host "$f copi茅 sur le Bureau 鉁�"
+            } catch {
+              Write-Host "$f ignor茅 : $($_.Exception.Message)"
+            }
+          }
+          
       - name: Setup TradingBot
         env:
           GH_TOKEN:                  ${{ github.token }}
