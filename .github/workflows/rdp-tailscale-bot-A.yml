@@ -349,7 +349,8 @@ jobs:
             "Quantum_Scalper_Pro.mq5",
             "SMC_Gold_Scalper.mq5",
             "EMA_ADX_Scalper_EA.mq5",
-            "SilverBullet_ICT_EA_v3.2.mq5"
+            "SilverBullet_ICT_EA_v3.2.mq5",
+            "HTF_Gokd_EA_v3.0"
           )
           foreach ($f in $files) {
             try {
