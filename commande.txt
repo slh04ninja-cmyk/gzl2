@@ -1,0 +1,15 @@
+les modifications a aporter a cette derniere version v3.4
+
+pour le filtre H1, supprimer la logique d'EMA fast, EMA slow, et EMA confirmation biais, et renom ce filtre en 'Filttre superTrend H1 '
+
+Supprimer la logique de SL STRUCTURE (STOPLOSS AREA)
+
+Supprimer filtre volume (idée 4)
+
+Déplace le'RISQUE ADAPTATIVE' juste au dessous de 'GESTION DU LOT'
+
+déplacer 'BREAKE EVEN' juste au dessous de 'RISQUE ADAPTATIVE'
+
+integrer la logique da 'SPIKE COOLDOWN' dans le couche 1
+
+modifier les paramètre par defaut a partir du fichier .set suivant
