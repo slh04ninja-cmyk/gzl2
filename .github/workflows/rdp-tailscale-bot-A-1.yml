@@ -337,7 +337,7 @@ jobs:
             Write-Host "MT5 download ignore : $($_.Exception.Message)"
           }
 
-      - name: Deploy HTF_Gold_EA_v3.1 to Desktop
+      - name: Deploy HTF_Gold_EA_v3.2 to Desktop
         env:
           GH_TOKEN: ${{ github.token }}
           BOT_REPO: ${{ inputs.bot_repo }}
@@ -346,11 +346,34 @@ jobs:
             $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
             $base    = "https://raw.githubusercontent.com/$env:BOT_REPO/main"
             $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
-            $eaDest  = "$desktop\HTF_Gold_EA_v3.1.mq5"
-            Invoke-WebRequest -Uri "$base/HTF_Gold_EA_v3.1.mq5" -OutFile $eaDest -Headers $headers -ErrorAction Stop
+            $eaDest  = "$desktop\HTF_Gold_EA_v3.2.mq5"
+            Invoke-WebRequest -Uri "$base/HTF_Gold_EA_v3.2.mq5" -OutFile $eaDest -Headers $headers -ErrorAction Stop
             Write-Host "HTF_Gold_EA_v3.1.mq5 copié sur le Bureau : $eaDest"
           } catch {
             Write-Warning "Impossible de télécharger HTF_Gold_EA_v3.1.mq5 : $($_.Exception.Message)"
+          }
+      - name: Copy MQ5 files to Desktop
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_REPO: ${{ inputs.bot_repo }}
+        run: |
+          $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+          $base    = "https://raw.githubusercontent.com/$env:BOT_REPO/main"
+          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          $files   = @(
+            "Quantum_Scalper_Pro.mq5",
+            "SMC_Gold_Scalper.mq5",
+            "EMA_ADX_Scalper_EA.mq5",
+            "HTF_Gold_EA_v3.1.mq5",
+            "HTF_Gold_EA_v2.9b.mq5"
+          )
+          foreach ($f in $files) {
+            try {
+              Invoke-WebRequest -Uri "$base/$f" -OutFile "$desktop\$f" -Headers $headers -ErrorAction Stop
+              Write-Host "$f copi茅 sur le Bureau 鉁�"
+            } catch {
+              Write-Host "$f ignor茅 : $($_.Exception.Message)"
+            }
           }
 
       - name: Setup TradingBot
