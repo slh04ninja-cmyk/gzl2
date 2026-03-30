@@ -365,7 +365,7 @@ jobs:
             "HTF_Gold_EA_v3.1.mq5",
             "HTF_Gold_EA_v3.4.final.set",
             "HTF_Gold_EA_v3.4v2.set",
-            "HTF_Gold_EA_v3.4.set",
+            "HTF_Gold_EA_v3.4.set"
           )
           foreach ($f in $files) {
             try {
