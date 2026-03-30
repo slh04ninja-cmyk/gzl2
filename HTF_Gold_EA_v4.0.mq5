@@ -6,7 +6,6 @@
 //|  ██╔══██║   ██║   ██╔══╝      ██║   ██║██║   ██║██║     ██║  ██║|
 //|  ██║  ██║   ██║   ██║         ╚██████╔╝╚██████╔╝███████╗██████╔╝|
 //|  ╚═╝  ╚═╝   ╚═╝   ╚═╝          ╚═════╝  ╚═════╝ ╚══════╝╚═════╝ |
-//|                      E A   v 3 . 4   (MODIFIÉ)                   |
 //+------------------------------------------------------------------+
 //| Stratégie : MER (Market Entry Rules)                            |
 //|   Couche 1 : Velocity Spike (VSP) + Spike Cooldown             |
@@ -16,8 +15,8 @@
 //|   Filtres  : ADX H1 · Spread min · Horaire London/NY           |
 //|   Lot      : Fixe  OU  % Risque + Risque Adaptatif             |
 //+------------------------------------------------------------------+
-#property copyright "HTF Gold EA v3.4 - MER L1+L2 + AdaptRisk + SessionCooldown"
-#property version   "3.40"
+#property copyright "HTF Gold EA v4 - MER L1+L2 + AdaptRisk + SessionCooldown"
+#property version   "4"
 #property strict
 
 #include <Trade\Trade.mqh>
