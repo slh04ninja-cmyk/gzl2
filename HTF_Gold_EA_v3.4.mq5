@@ -1,14 +1,23 @@
 //+------------------------------------------------------------------+
-//|                                            HTF_Gold_EA_v3.0.mq5 |
-//|          MER — Couche 1 : Velocity Spike (VSP)                  |
-//|               Couche 2 : Micro Structure Break (MSB)            |
-//|          H1 Bias : EMA OU Double SuperTrend                     |
-//|          SL/TP  : ATR OU Points (liste déroulante)              |
-//|          SL     : Structure Swing + ATR (Stoploss Areas)        |
-//|          LOT    : Fixe OU % Risque du capital                   |
+//|                                            HTF_Gold_EA_v3.4.mq5 |
+//|  ██╗  ██╗████████╗███████╗     ██████╗  ██████╗ ██╗     ██████╗ |
+//|  ██║  ██║╚══██╔══╝██╔════╝    ██╔════╝ ██╔═══██╗██║     ██╔══██╗|
+//|  ███████║   ██║   █████╗      ██║  ███╗██║   ██║██║     ██║  ██║|
+//|  ██╔══██║   ██║   ██╔══╝      ██║   ██║██║   ██║██║     ██║  ██║|
+//|  ██║  ██║   ██║   ██║         ╚██████╔╝╚██████╔╝███████╗██████╔╝|
+//|  ╚═╝  ╚═╝   ╚═╝   ╚═╝          ╚═════╝  ╚═════╝ ╚══════╝╚═════╝ |
+//|                      E A   v 3 . 4   (MODIFIÉ)                   |
 //+------------------------------------------------------------------+
-#property copyright "HTF Gold EA v3.0 - MER Layer 1+2 + StoplosAreas + Risk%"
-#property version   "3.00"
+//| Stratégie : MER (Market Entry Rules)                            |
+//|   Couche 1 : Velocity Spike (VSP) + Spike Cooldown             |
+//|   Couche 2 : Micro Structure Break (MSB)                       |
+//|   Biais    : Double SuperTrend H1                              |
+//|   SL/TP    : ATR dynamique  OU  Points fixes                   |
+//|   Filtres  : ADX H1 · Spread min · Horaire London/NY           |
+//|   Lot      : Fixe  OU  % Risque + Risque Adaptatif             |
+//+------------------------------------------------------------------+
+#property copyright "HTF Gold EA v3.4 - MER L1+L2 + AdaptRisk + SessionCooldown"
+#property version   "3.40"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -17,12 +26,6 @@
 //+------------------------------------------------------------------+
 //| ENUMS                                                            |
 //+------------------------------------------------------------------+
-enum ENUM_H1_FILTER
-{
-   H1_FILTER_EMA        = 0,  // EMAs (EMA Fast / EMA Slow)
-   H1_FILTER_SUPERTREND = 1   // Double SuperTrend
-};
-
 enum ENUM_SLTP_MODE
 {
    SLTP_MODE_ATR    = 0,  // ATR (dynamique)
@@ -54,67 +57,72 @@ enum ENUM_LOT_MODE
 input group "=== SYMBOL ==="
 input string            InpSymbol           = "";            // Symbol (vide = chart actuel)
 
-input group "=== FILTRE H1 ==="
-input ENUM_H1_FILTER    InpH1FilterType     = H1_FILTER_SUPERTREND; // Filtre H1
-input int               InpH1_EMA_Fast      = 35;            // [EMA] Période Fast
-input int               InpH1_EMA_Slow      = 80;           // [EMA] Période Slow
-input bool              InpH1_ConfirmH1Bar  = false;          // [EMA] Confirmer biais : prix actuel vs Open H1[0]
-input int               InpST1_Period       = 5;            // [ST1] Période ATR
+input group "=== FILTRE SUPERTREND H1 ==="
+input int               InpST1_Period       = 7;             // [ST1] Période ATR
 input double            InpST1_Multiplier   = 0.4;           // [ST1] Multiplicateur
-input int               InpST2_Period       = 13;                   // [ST2] Période ATR
-input double            InpST2_Multiplier   = 1.3;           // [ST2] Multiplicateur
+input int               InpST2_Period       = 11;            // [ST2] Période ATR
+input double            InpST2_Multiplier   = 1.2;           // [ST2] Multiplicateur
+
+input group "=== FILTRE ADX H1 ==="
+input bool              InpUseADX           = true;          // Activer filtre ADX H1
+input int               InpADX_Period       = 12;            // Période ADX H1
+input double            InpADX_MinLevel     = 23.0;          // ADX minimum (tendance > range)
+
+input group "=== SL MINIMUM SPREAD ==="
+input bool              InpUseSpreadSL      = false;         // Activer SL minimum basé sur spread
+input int               InpSpread_Buffer    = 50;            // Buffer sécurité en points (spread + X pts)
 
 input group "=== COUCHE 1 : VELOCITY SPIKE (VSP) ==="
-input int               InpVSP_ATR_Period   = 17;            // ATR Period pour spike
+input int               InpVSP_ATR_Period   = 16;            // ATR Period pour spike
 input double            InpVSP_Spike_Multi  = 1.6;           // Corps bougie > X * ATR = Spike
 input bool              InpVSP_NeedConfirm  = true;          // Attendre bougie confirmation
-input int               InpVSP_LookBack     = 9;                    // Chercher spike dans X bougies passées
+input int               InpVSP_LookBack     = 7;             // Chercher spike dans X bougies passées
+input bool              InpUseCooldown      = true;          // Activer filtre spike cooldown (intégré)
+input int               InpCooldownBars     = 5;             // Bougies M1 mini entre 2 spikes (même direction)
 
 input group "=== COUCHE 2 : MICRO STRUCTURE BREAK (MSB) ==="
 input bool              InpUseMSB           = true;          // Activer Couche 2 MSB
-input int               InpMSB_SwingBars    = 16;             // Bougies pour détecter swing high/low
-input ENUM_MSB_BREAK    InpMSB_BreakType    = MSB_BREAK_CLOSE; // Condition de cassure
+input int               InpMSB_SwingBars    = 16;            // Bougies pour détecter swing high/low
+input ENUM_MSB_BREAK    InpMSB_BreakType    = MSB_BREAK_TOUCH; // Condition de cassure
 input ENUM_MSB_TIMING   InpMSB_Timing       = MSB_TIMING_BEFORE; // MSB avant ou après le spike
 
 input group "=== MODE SL/TP ==="
 input ENUM_SLTP_MODE    InpSLTP_Mode        = SLTP_MODE_ATR; // Mode calcul SL/TP
 
 // --- Sous-groupe ATR
-input int               InpATR_SL_Period    = 16;                   // [ATR] Période ATR pour SL
-input double            InpATR_SL_Multi     = 1.6;                  // [ATR] Multiplicateur SL
-input double            InpRR_Ratio         = 2.0;                  // [ATR/PTS] Risk:Reward TP
+input int               InpATR_SL_Period    = 15;            // [ATR] Période ATR pour SL
+input double            InpATR_SL_Multi     = 1.5;           // [ATR] Multiplicateur SL
+input double            InpRR_Ratio         = 2.1;           // [ATR/PTS] Risk:Reward TP
 
 // --- Sous-groupe Points
-// XAUUSDm : 1 point = 0.01$ sur 0.01 lot → 1000 pts = 10$
 input int               InpSL_Points        = 5000;          // [PTS] SL en points (5000 pts = 5$)
 input int               InpTP_Points        = 7500;          // [PTS] TP en points (7500 pts = 7.5$)
 
-input group "=== SL STRUCTURE (STOPLOSS AREAS) ==="
-input bool              InpUseStructureSL   = true;          // Activer SL basé sur structure swing
-input int               InpStructure_ATR    = 14;            // [Structure] Période ATR
-input int               InpStructure_LB     = 7;             // [Structure] Lookback swing high/low
-input double            InpStructure_Multi  = 1.0;           // [Structure] Multiplicateur ATR
-input int               InpTP_MaxPoints     = 10000;         // [Structure] TP maximum en points (0=désactivé)
-
 input group "=== GESTION DU LOT ==="
-input ENUM_LOT_MODE     InpLotMode          = LOT_MODE_FIXED;       // Mode lot (Fixe / % Risque)
-input double            InpLotSize          = 0.01;                 // [FIXE] Lot fixe
-input double            InpRiskPercent      = 1.0;                  // [%] Risque par trade (% capital)
-input double            InpLotMin           = 0.01;                 // [%] Lot minimum autorisé
-input double            InpLotMax           = 1.00;                 // [%] Lot maximum autorisé
+input ENUM_LOT_MODE     InpLotMode          = LOT_MODE_PERCENT; // Mode lot (Fixe / % Risque)
+input double            InpLotSize          = 0.01;          // [FIXE] Lot fixe
+input double            InpRiskPercent      = 1.0;           // [%] Risque par trade (% capital)
+input double            InpLotMin           = 0.01;          // [%] Lot minimum autorisé
+input double            InpLotMax           = 1.00;          // [%] Lot maximum autorisé
 
-input group "=== TRADE MANAGEMENT ==="
-input int               InpMaxTrades        = 3;                    // Max trades simultanés
-input int               InpMagicNumber      = 202602;               // Magic Number
-input int               InpSlippage         = 10;                   // Slippage (points)
+input group "=== RISQUE ADAPTATIF (Idée 5) ==="
+input bool              InpUseAdaptiveRisk  = true;          // Activer gestion risque adaptative
+input int               InpAR_LossThreshold = 4;             // Nb pertes consécutives → réduction
+input double            InpAR_ReduceFactor  = 0.25;          // Facteur réduction (ex: 0.5 = moitié)
+input double            InpAR_MaxBoost      = 3.0;           // Boost max après gains (ex: 1.25 = +25%)
 
 input group "=== BREAKEVEN ==="
-input bool              InpUseBreakeven     = true;         // Activer Breakeven
-input double            InpBE_Trigger_RR    = 1.0;                  // Déclencher BE à X * TP dist
+input bool              InpUseBreakeven     = true;          // Activer Breakeven
+input double            InpBE_Trigger_RR    = 1.4;           // Déclencher BE à X * TP dist
+
+input group "=== TRADE MANAGEMENT ==="
+input int               InpMaxTrades        = 3;             // Max trades simultanés
+input int               InpMagicNumber      = 202602;        // Magic Number
+input int               InpSlippage         = 10;            // Slippage (points)
 
 input group "=== FERMETURE PAR TEMPS ==="
 input bool              InpUseTimeClose     = true;          // Activer fermeture par temps
-input int               InpMaxMinutes       = 30;                   // Fermer après X minutes
+input int               InpMaxMinutes       = 24;            // Fermer après X minutes
 
 input group "=== FILTRE HORAIRE ==="
 input bool              InpUseTimeFilter    = true;          // Filtre horaire actif
@@ -122,8 +130,9 @@ input bool              InpUseWindow1       = true;          // Fenêtre 1 activ
 input int               InpW1_Start         = 7;             // [W1] Heure début London
 input int               InpW1_End           = 12;            // [W1] Heure fin London (exclu)
 input bool              InpUseWindow2       = true;          // Fenêtre 2 active (NY)
-input int               InpW2_Start         = 14;                   // [W2] Heure début NY
+input int               InpW2_Start         = 14;            // [W2] Heure début NY
 input int               InpW2_End           = 20;            // [W2] Heure fin NY (exclu)
+input int               InpSessionCooldownMin = 15;          // Minutes à ignorer après ouverture session
 
 //+------------------------------------------------------------------+
 //| STRUCTURES                                                       |
@@ -159,16 +168,19 @@ string         g_symbol;
 int            g_digits;
 double         g_point;
 
-int            h1_ema_fast_handle  = INVALID_HANDLE;
-int            h1_ema_slow_handle  = INVALID_HANDLE;
+// Spike Cooldown : timestamp du dernier spike par direction
+// [0] = BUY (+1)  |  [1] = SELL (-1)
+datetime       g_lastSpikeTime[2];
+
+// Risque adaptatif : compteurs de séries
+int            g_consecutiveLosses = 0;
+int            g_consecutiveWins   = 0;
+double         g_currentRiskMult   = 1.0; // multiplicateur actuel du risque
+
+// Handles indicateurs
 int            m1_atr_sl_handle    = INVALID_HANDLE;
 int            m1_atr_vsp_handle   = INVALID_HANDLE;
-int            m1_atr_str_handle   = INVALID_HANDLE; // ATR pour Structure SL
-
-double         h1_ema_fast[];
-double         h1_ema_slow[];
-double         m1_atr_sl[];
-double         m1_atr_vsp[];
+int            h1_adx_handle       = INVALID_HANDLE;
 
 //+------------------------------------------------------------------+
 //| INIT                                                             |
@@ -183,47 +195,45 @@ int OnInit()
    trade.SetDeviationInPoints(InpSlippage);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
 
-   // H1 EMA
-   h1_ema_fast_handle = iMA(g_symbol, PERIOD_H1, InpH1_EMA_Fast, 0, MODE_EMA, PRICE_CLOSE);
-   h1_ema_slow_handle = iMA(g_symbol, PERIOD_H1, InpH1_EMA_Slow, 0, MODE_EMA, PRICE_CLOSE);
+   // Initialiser les timestamps cooldown
+   g_lastSpikeTime[0] = 0; // BUY
+   g_lastSpikeTime[1] = 0; // SELL
 
-   // M1 ATR handles
+   // Initialiser risque adaptatif
+   g_consecutiveLosses = 0;
+   g_consecutiveWins   = 0;
+   g_currentRiskMult   = 1.0;
+
+   // Handles M1 ATR
    m1_atr_sl_handle  = iATR(g_symbol, PERIOD_M1, InpATR_SL_Period);
    m1_atr_vsp_handle = iATR(g_symbol, PERIOD_M1, InpVSP_ATR_Period);
-   m1_atr_str_handle = iATR(g_symbol, PERIOD_M1, InpStructure_ATR);
 
-   if(h1_ema_fast_handle == INVALID_HANDLE || h1_ema_slow_handle == INVALID_HANDLE ||
-      m1_atr_sl_handle   == INVALID_HANDLE || m1_atr_vsp_handle  == INVALID_HANDLE ||
-      m1_atr_str_handle  == INVALID_HANDLE)
+   // ADX H1
+   h1_adx_handle = iADX(g_symbol, PERIOD_H1, InpADX_Period);
+
+   if(m1_atr_sl_handle   == INVALID_HANDLE || m1_atr_vsp_handle  == INVALID_HANDLE ||
+      h1_adx_handle      == INVALID_HANDLE)
    {
       Print("ERREUR: Création handles échouée.");
       return INIT_FAILED;
    }
 
-   ArraySetAsSeries(h1_ema_fast, true);
-   ArraySetAsSeries(h1_ema_slow, true);
-   ArraySetAsSeries(m1_atr_sl,   true);
-   ArraySetAsSeries(m1_atr_vsp,  true);
-
    // Log configuration
-   string filterName = (InpH1FilterType == H1_FILTER_EMA) ?
-                       StringFormat("EMA(%d/%d)", InpH1_EMA_Fast, InpH1_EMA_Slow) :
-                       StringFormat("DoubleST(%d×%.1f / %d×%.1f)",
-                                    InpST1_Period, InpST1_Multiplier,
-                                    InpST2_Period, InpST2_Multiplier);
-
    string sltpName = (InpSLTP_Mode == SLTP_MODE_ATR) ?
                      StringFormat("ATR(%d)×%.1f | RR=%.1f", InpATR_SL_Period, InpATR_SL_Multi, InpRR_Ratio) :
                      StringFormat("Points | SL=%d pts (%.2f$) | TP=%d pts (%.2f$)",
                                   InpSL_Points, InpSL_Points * InpLotSize * 0.1,
                                   InpTP_Points, InpTP_Points * InpLotSize * 0.1);
 
-   PrintFormat("HTF Gold EA v2.9 [MER-L1+L2] | %s | H1: %s%s | SL/TP: %s | MSB: %s",
-               g_symbol, filterName,
-               (InpH1FilterType==H1_FILTER_EMA && InpH1_ConfirmH1Bar) ? "+ConfirmH1[0]" : "",
+   PrintFormat("HTF Gold EA v3.4 (modifié) | %s | H1: DoubleST(%d×%.1f / %d×%.1f) | SL/TP: %s | MSB: %s | Cooldown intégré: %d bougies | AdaptRisk: %s | SessCooldown: %dmin",
+               g_symbol,
+               InpST1_Period, InpST1_Multiplier,
+               InpST2_Period, InpST2_Multiplier,
                sltpName,
-               InpUseMSB ? StringFormat("ON SwingBars=%d Break=%d Timing=%d",
-                           InpMSB_SwingBars, InpMSB_BreakType, InpMSB_Timing) : "OFF");
+               InpUseMSB ? StringFormat("ON SwingBars=%d Break=%d Timing=%d", InpMSB_SwingBars, InpMSB_BreakType, InpMSB_Timing) : "OFF",
+               InpUseCooldown ? InpCooldownBars : 0,
+               InpUseAdaptiveRisk ? StringFormat("ON seuil=%d fact=%.2f boost=%.2f", InpAR_LossThreshold, InpAR_ReduceFactor, InpAR_MaxBoost) : "OFF",
+               InpSessionCooldownMin);
    return INIT_SUCCEEDED;
 }
 
@@ -232,11 +242,9 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   IndicatorRelease(h1_ema_fast_handle);
-   IndicatorRelease(h1_ema_slow_handle);
    IndicatorRelease(m1_atr_sl_handle);
    IndicatorRelease(m1_atr_vsp_handle);
-   IndicatorRelease(m1_atr_str_handle);
+   IndicatorRelease(h1_adx_handle);
 }
 
 //+------------------------------------------------------------------+
@@ -249,6 +257,9 @@ void OnTick()
    datetime currentBar = iTime(g_symbol, PERIOD_M1, 0);
    if(currentBar == lastBar) return;
    lastBar = currentBar;
+
+   // Mise à jour risque adaptatif (analyse dernier trade clôturé)
+   UpdateAdaptiveRisk();
 
    // Filtre horaire
    if(InpUseTimeFilter && !IsTradeHour()) return;
@@ -263,21 +274,36 @@ void OnTick()
    if(CountOpenTrades() >= InpMaxTrades) return;
 
    // Copier ATR buffers
+   double m1_atr_sl[], m1_atr_vsp[];
+   ArraySetAsSeries(m1_atr_sl,  true);
+   ArraySetAsSeries(m1_atr_vsp, true);
    if(CopyBuffer(m1_atr_sl_handle,  0, 0, 5, m1_atr_sl)                    < 5) return;
    if(CopyBuffer(m1_atr_vsp_handle, 0, 0, InpVSP_LookBack + 3, m1_atr_vsp) < InpVSP_LookBack + 3) return;
 
-   // Biais H1
-   int h1Bias = (InpH1FilterType == H1_FILTER_EMA) ? GetH1Bias_EMA() : GetH1Bias_SuperTrend();
+   // Biais H1 (uniquement SuperTrend)
+   int h1Bias = GetH1Bias_SuperTrend();
    if(h1Bias == 0) return;
 
-   // Détection VSP
+   // Filtre ADX H1
+   if(InpUseADX)
+   {
+      double adxBuf[];
+      ArraySetAsSeries(adxBuf, true);
+      if(CopyBuffer(h1_adx_handle, 0, 0, 3, adxBuf) < 3) return;
+      double adxVal = adxBuf[1]; // barre H1 fermée
+      if(adxVal < InpADX_MinLevel)
+      {
+         PrintFormat("[ADX BLOQUÉ] ADX H1=%.2f < seuil=%.1f → range détecté → pas de trade",
+                     adxVal, InpADX_MinLevel);
+         return;
+      }
+   }
+
+   // Détection VSP (avec cooldown intégré)
    VSP_Result vsp = DetectVelocitySpike();
    if(!vsp.detected) return;
 
    // RÈGLE ABSOLUE : spike DOIT être strictement opposé au biais H1
-   // H1 Bullish (+1) → spike baissier (-1) uniquement
-   // H1 Bearish (-1) → spike haussier (+1) uniquement
-   // Tout autre cas = trade contre biais interdit
    if(vsp.direction != -h1Bias)
    {
       PrintFormat("[VSP BLOQUÉ] spike=%d biais H1=%d → contre-biais interdit",
@@ -289,8 +315,6 @@ void OnTick()
    int signal = h1Bias;
 
    // Confirmation bougie DOIT être dans la direction du biais H1
-   // H1 Bullish → confirmation haussière (close > open)
-   // H1 Bearish → confirmation baissière (close < open)
    if(InpVSP_NeedConfirm)
    {
       double closeC = iClose(g_symbol, PERIOD_M1, 1);
@@ -307,11 +331,7 @@ void OnTick()
       }
    }
 
-   //=================================================================
-   // COUCHE 2 : MICRO STRUCTURE BREAK (MSB)
-   // Vérifie qu'il y a une vraie cassure de structure M1
-   // dans la direction du signal avant d'entrer
-   //=================================================================
+   // Couche 2 : MSB
    if(InpUseMSB)
    {
       MSB_Result msb = DetectMSB(signal, vsp.barIndex);
@@ -345,78 +365,49 @@ void OnTick()
    // Calculer le lot selon le mode choisi
    double lotSize = CalcLotSize(slDist);
 
+   // Filtre SL minimum basé sur spread
+   if(InpUseSpreadSL)
+   {
+      double spreadPoints = (double)SymbolInfoInteger(g_symbol, SYMBOL_SPREAD);
+      double slMinDist    = (spreadPoints + InpSpread_Buffer) * g_point;
+      if(slDist < slMinDist)
+      {
+         PrintFormat("[SPREAD SL BLOQUÉ] SL=%.1f pts < min=%.1f pts (spread=%.1f + buffer=%d) → trade rejeté",
+                     slDist/g_point, slMinDist/g_point, spreadPoints, InpSpread_Buffer);
+         return;
+      }
+   }
+
    if(signal == 1 && !HasOpenTrade(POSITION_TYPE_BUY))
    {
-      double sl, tp;
-
-      if(InpUseStructureSL)
-      {
-         // SL basé sur Structure : lowest(low, LB) - ATR × Multi
-         double strSL = CalcStructureSL(1);
-         if(strSL <= 0) strSL = ask - slDist; // fallback ATR
-         sl = NormalizeDouble(strSL, g_digits);
-         // TP basé sur distance SL réelle × RR
-         double realSlDist = ask - sl;
-         double realTpDist = realSlDist * InpRR_Ratio;
-         // Appliquer limite TP maximum si activée
-         if(InpTP_MaxPoints > 0)
-            realTpDist = MathMin(realTpDist, InpTP_MaxPoints * g_point);
-         tp = NormalizeDouble(ask + realTpDist, g_digits);
-         // Recalculer lot avec SL réel
-         lotSize = CalcLotSize(realSlDist);
-         PrintFormat("[StructureSL] BUY SL=%.3f (dist=%.1f pts) TP=%.3f (dist=%.1f pts) RR=%.1f",
-                     sl, realSlDist/g_point, tp, realTpDist/g_point, InpRR_Ratio);
-      }
-      else
-      {
-         sl = NormalizeDouble(ask - slDist, g_digits);
-         tp = NormalizeDouble(ask + tpDist, g_digits);
-      }
+      double sl = NormalizeDouble(ask - slDist, g_digits);
+      double tp = NormalizeDouble(ask + tpDist, g_digits);
 
       if(trade.Buy(lotSize, g_symbol, ask, sl, tp,
                    StringFormat("HTF-v3|BUY|%s|lot=%.2f|spike@%d",
-                                InpUseStructureSL?"STR":(InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"),
+                                (InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"),
                                 lotSize, vsp.barIndex)))
+      {
          PrintSignal("BUY", ask, sl, tp, MathAbs(ask-sl), MathAbs(tp-ask), vsp);
+      }
    }
    else if(signal == -1 && !HasOpenTrade(POSITION_TYPE_SELL))
    {
-      double sl, tp;
-
-      if(InpUseStructureSL)
-      {
-         // SL basé sur Structure : highest(high, LB) + ATR × Multi
-         double strSL = CalcStructureSL(-1);
-         if(strSL <= 0) strSL = bid + slDist; // fallback ATR
-         sl = NormalizeDouble(strSL, g_digits);
-         // TP basé sur distance SL réelle × RR
-         double realSlDist = sl - bid;
-         double realTpDist = realSlDist * InpRR_Ratio;
-         // Appliquer limite TP maximum si activée
-         if(InpTP_MaxPoints > 0)
-            realTpDist = MathMin(realTpDist, InpTP_MaxPoints * g_point);
-         tp = NormalizeDouble(bid - realTpDist, g_digits);
-         // Recalculer lot avec SL réel
-         lotSize = CalcLotSize(realSlDist);
-         PrintFormat("[StructureSL] SELL SL=%.3f (dist=%.1f pts) TP=%.3f (dist=%.1f pts) RR=%.1f",
-                     sl, realSlDist/g_point, tp, realTpDist/g_point, InpRR_Ratio);
-      }
-      else
-      {
-         sl = NormalizeDouble(bid + slDist, g_digits);
-         tp = NormalizeDouble(bid - tpDist, g_digits);
-      }
+      double sl = NormalizeDouble(bid + slDist, g_digits);
+      double tp = NormalizeDouble(bid - tpDist, g_digits);
 
       if(trade.Sell(lotSize, g_symbol, bid, sl, tp,
                     StringFormat("HTF-v3|SELL|%s|lot=%.2f|spike@%d",
-                                 InpUseStructureSL?"STR":(InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"),
+                                 (InpSLTP_Mode==SLTP_MODE_ATR?"ATR":"PTS"),
                                  lotSize, vsp.barIndex)))
+      {
          PrintSignal("SELL", bid, sl, tp, MathAbs(bid-sl), MathAbs(bid-tp), vsp);
+      }
    }
 }
 
 //+------------------------------------------------------------------+
-//| DÉTECTION VELOCITY SPIKE                                         |
+//| DÉTECTION VELOCITY SPIKE AVEC COOLDOWN INTÉGRÉ                  |
 //+------------------------------------------------------------------+
 VSP_Result DetectVelocitySpike()
 {
@@ -434,6 +425,10 @@ VSP_Result DetectVelocitySpike()
    if(CopyOpen(g_symbol,  PERIOD_M1, 0, barsToCheck, open)  < barsToCheck) return result;
    if(CopyClose(g_symbol, PERIOD_M1, 0, barsToCheck, close) < barsToCheck) return result;
 
+   double m1_atr_vsp[];
+   ArraySetAsSeries(m1_atr_vsp, true);
+   if(CopyBuffer(m1_atr_vsp_handle, 0, 0, barsToCheck, m1_atr_vsp) < barsToCheck) return result;
+
    for(int i = 2; i <= InpVSP_LookBack + 1; i++)
    {
       double bodySize  = MathAbs(close[i] - open[i]);
@@ -441,10 +436,25 @@ VSP_Result DetectVelocitySpike()
 
       if(bodySize >= threshold)
       {
+         int dir = (close[i] > open[i]) ? 1 : -1;
+
+         // Vérification cooldown intégrée
+         if(InpUseCooldown)
+         {
+            int dirIdx = (dir == 1) ? 0 : 1;
+            int barsElapsed = (int)((TimeCurrent() - g_lastSpikeTime[dirIdx]) / 60);
+            if(g_lastSpikeTime[dirIdx] > 0 && barsElapsed < InpCooldownBars)
+            {
+               PrintFormat("[COOLDOWN] Spike %s bar[%d] bloqué — dernier spike il y a %d bougie(s) < seuil %d",
+                           (dir == 1 ? "BUY" : "SELL"), i, barsElapsed, InpCooldownBars);
+               continue; // spike rejeté
+            }
+         }
+
          result.detected  = true;
          result.barIndex  = i;
          result.spikeSize = bodySize;
-         result.direction = (close[i] > open[i]) ? 1 : -1;
+         result.direction = dir;
          break;
       }
    }
@@ -453,19 +463,6 @@ VSP_Result DetectVelocitySpike()
 
 //+------------------------------------------------------------------+
 //| COUCHE 2 — MICRO STRUCTURE BREAK (MSB)                         |
-//|                                                                  |
-//| Logique :                                                        |
-//| 1. Identifier le swing high/low de référence sur M1             |
-//|    dans InpMSB_SwingBars bougies                                |
-//| 2. Vérifier que le prix a cassé ce swing                        |
-//|    dans la direction du signal                                   |
-//|                                                                  |
-//| Signal BUY  (+1) → cherche swing LOW cassé vers le haut        |
-//| Signal SELL (-1) → cherche swing HIGH cassé vers le bas        |
-//|                                                                  |
-//| Timing :                                                         |
-//| BEFORE → le MSB s'est produit avant le spike                   |
-//| AFTER  → le MSB s'est produit après le spike (bar[1])          |
 //+------------------------------------------------------------------+
 MSB_Result DetectMSB(int signal, int spikeBarIndex)
 {
@@ -474,9 +471,6 @@ MSB_Result DetectMSB(int signal, int spikeBarIndex)
    result.swingLevel = 0.0;
    result.barIndex   = 0;
 
-   // Nombre total de bougies à charger
-   // On regarde InpMSB_SwingBars bougies pour trouver le swing
-   // + quelques bougies de marge
    int totalBars = InpMSB_SwingBars + spikeBarIndex + 3;
 
    double highBuf[], lowBuf[], closeBuf[], openBuf[];
@@ -490,26 +484,18 @@ MSB_Result DetectMSB(int signal, int spikeBarIndex)
    if(CopyClose(g_symbol, PERIOD_M1, 0, totalBars, closeBuf) < totalBars) return result;
    if(CopyOpen (g_symbol, PERIOD_M1, 0, totalBars, openBuf)  < totalBars) return result;
 
-   // Définir la zone de recherche selon le timing
-   // bar[0] = en cours, bar[1] = dernière fermée
-   // AFTER  : cherche MSB dans bar[1] (après spike à bar[spikeBarIndex])
-   // BEFORE : cherche MSB dans bar[spikeBarIndex+1..spikeBarIndex+SwingBars]
-
    if(InpMSB_Timing == MSB_TIMING_AFTER)
    {
-      // Trouver le swing dans les bougies AVANT le spike
-      // zone : bar[spikeBarIndex+1 .. spikeBarIndex+SwingBars]
       int zoneStart = spikeBarIndex + 1;
       int zoneEnd   = spikeBarIndex + InpMSB_SwingBars;
       if(zoneEnd >= totalBars) return result;
 
-      if(signal == 1) // BUY → cherche swing LOW dans la zone
+      if(signal == 1)
       {
          double swingLow = lowBuf[zoneStart];
          for(int i = zoneStart + 1; i <= zoneEnd; i++)
             if(lowBuf[i] < swingLow) swingLow = lowBuf[i];
 
-         // Le MSB = bar[1] (après spike) casse ce swing LOW vers le haut
          bool broken = false;
          switch(InpMSB_BreakType)
          {
@@ -524,13 +510,12 @@ MSB_Result DetectMSB(int signal, int spikeBarIndex)
             result.barIndex   = 1;
          }
       }
-      else if(signal == -1) // SELL → cherche swing HIGH dans la zone
+      else if(signal == -1)
       {
          double swingHigh = highBuf[zoneStart];
          for(int i = zoneStart + 1; i <= zoneEnd; i++)
             if(highBuf[i] > swingHigh) swingHigh = highBuf[i];
 
-         // Le MSB = bar[1] (après spike) casse ce swing HIGH vers le bas
          bool broken = false;
          switch(InpMSB_BreakType)
          {
@@ -548,20 +533,17 @@ MSB_Result DetectMSB(int signal, int spikeBarIndex)
    }
    else // MSB_TIMING_BEFORE
    {
-      // Le MSB s'est produit AVANT le spike
-      // zone : bar[2..spikeBarIndex-1] doit avoir cassé un swing antérieur
       if(spikeBarIndex < 2) return result;
 
       int zoneStart = 2;
       int zoneEnd   = spikeBarIndex - 1;
       if(zoneStart > zoneEnd) return result;
 
-      // Swing de référence : bougies APRÈS le spike (plus anciennes)
       int refStart = spikeBarIndex + 1;
       int refEnd   = spikeBarIndex + InpMSB_SwingBars;
       if(refEnd >= totalBars) return result;
 
-      if(signal == 1) // BUY → swing LOW antérieur cassé avant le spike
+      if(signal == 1)
       {
          double swingLow = lowBuf[refStart];
          for(int i = refStart + 1; i <= refEnd; i++)
@@ -585,7 +567,7 @@ MSB_Result DetectMSB(int signal, int spikeBarIndex)
             }
          }
       }
-      else if(signal == -1) // SELL → swing HIGH antérieur cassé avant le spike
+      else if(signal == -1)
       {
          double swingHigh = highBuf[refStart];
          for(int i = refStart + 1; i <= refEnd; i++)
@@ -612,41 +594,6 @@ MSB_Result DetectMSB(int signal, int spikeBarIndex)
    }
 
    return result;
-}
-
-//+------------------------------------------------------------------+
-//| BIAIS H1 — EMA                                                  |
-//| Condition 1 (obligatoire) : EMA_Fast[1] vs EMA_Slow[1]         |
-//|   Barre H1 FERMÉE → biais stable et confirmé                   |
-//| Condition 2 (optionnelle) : prix actuel vs Open H1[0]          |
-//|   H1 BULL → prix actuel > Open H1[0]                          |
-//|   H1 BEAR → prix actuel < Open H1[0]                          |
-//+------------------------------------------------------------------+
-int GetH1Bias_EMA()
-{
-   if(CopyBuffer(h1_ema_fast_handle, 0, 0, 3, h1_ema_fast) < 3) return 0;
-   if(CopyBuffer(h1_ema_slow_handle, 0, 0, 3, h1_ema_slow) < 3) return 0;
-
-   // Condition 1 : barre H1 FERMÉE [1] — obligatoire
-   int bias = 0;
-   if(h1_ema_fast[1] > h1_ema_slow[1]) bias =  1; // BULLISH
-   if(h1_ema_fast[1] < h1_ema_slow[1]) bias = -1; // BEARISH
-   if(bias == 0) return 0;
-
-   // Condition 2 : confirmation par prix actuel vs Open H1[0] — optionnelle
-   if(InpH1_ConfirmH1Bar)
-   {
-      double currentBid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
-      double openH1     = iOpen(g_symbol, PERIOD_H1, 0);
-      if(openH1 <= 0) return 0;
-
-      // BULL confirmé uniquement si prix actuel > Open H1[0]
-      if(bias ==  1 && currentBid < openH1) return 0;
-      // BEAR confirmé uniquement si prix actuel < Open H1[0]
-      if(bias == -1 && currentBid > openH1) return 0;
-   }
-
-   return bias;
 }
 
 //+------------------------------------------------------------------+
@@ -719,7 +666,6 @@ SuperTrendData CalcSuperTrend(ENUM_TIMEFRAMES tf, int period, double multiplier,
 
 //+------------------------------------------------------------------+
 //| FERMETURE PAR TEMPS                                              |
-//| Ferme tout trade ouvert depuis plus de InpMaxMinutes minutes    |
 //+------------------------------------------------------------------+
 void CheckTimeClose()
 {
@@ -811,14 +757,26 @@ bool IsTradeHour()
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    int h = dt.hour;
+   int m = dt.min;
 
-   // Fenêtre 1 : London  (défaut 07:00 → 11:59)
    bool inW1 = InpUseWindow1 && (h >= InpW1_Start && h < InpW1_End);
-
-   // Fenêtre 2 : NY      (défaut 14:00 → 19:59)
    bool inW2 = InpUseWindow2 && (h >= InpW2_Start && h < InpW2_End);
 
-   return (inW1 || inW2);
+   if(!inW1 && !inW2) return false;
+
+   if(InpSessionCooldownMin > 0)
+   {
+      bool openingW1 = InpUseWindow1 && (h == InpW1_Start) && (m < InpSessionCooldownMin);
+      bool openingW2 = InpUseWindow2 && (h == InpW2_Start) && (m < InpSessionCooldownMin);
+      if(openingW1 || openingW2)
+      {
+         PrintFormat("[SESSION COOLDOWN] Ouverture session → attente %d min (actuellement %02d:%02d)",
+                     InpSessionCooldownMin, h, m);
+         return false;
+      }
+   }
+
+   return true;
 }
 
 void PrintSignal(string dir, double price, double sl, double tp,
@@ -838,90 +796,85 @@ void PrintSignal(string dir, double price, double sl, double tp,
 }
 
 //+------------------------------------------------------------------+
-//| STOPLOSS AREAS — Structure SL                                   |
-//|                                                                  |
-//| Inspiré de l'indicateur "Stoploss area's" par chadmex           |
-//| BUY  : longstop  = lowest(low,  LB) - ATR × Multi              |
-//| SELL : shortstop = highest(high, LB) + ATR × Multi             |
-//|                                                                  |
-//| Paramètres : ATR(14), Lookback(7), Multiplier(1.0)              |
+//| GESTION RISQUE ADAPTATIVE (Idée 5)                              |
 //+------------------------------------------------------------------+
-double CalcStructureSL(int direction)
+void UpdateAdaptiveRisk()
 {
-   int barsNeeded = InpStructure_LB + 2;
+   if(!InpUseAdaptiveRisk) return;
+   if(InpLotMode == LOT_MODE_FIXED) return;
 
-   double atrBuf[], highBuf[], lowBuf[];
-   ArraySetAsSeries(atrBuf,  true);
-   ArraySetAsSeries(highBuf, true);
-   ArraySetAsSeries(lowBuf,  true);
+   if(!HistorySelect(TimeCurrent() - 7*24*3600, TimeCurrent())) return;
 
-   if(CopyBuffer(m1_atr_str_handle, 0, 0, barsNeeded, atrBuf)  < barsNeeded) return 0.0;
-   if(CopyHigh(g_symbol, PERIOD_M1, 0, barsNeeded, highBuf)    < barsNeeded) return 0.0;
-   if(CopyLow(g_symbol,  PERIOD_M1, 0, barsNeeded, lowBuf)     < barsNeeded) return 0.0;
-
-   double atr = atrBuf[1]; // barre M1 fermée
-   if(atr <= 0) return 0.0;
-
-   double realatr = atr * InpStructure_Multi;
-
-   if(direction == 1) // BUY → longstop = lowest(low, LB) - realatr
+   int totalDeals = HistoryDealsTotal();
+   for(int i = totalDeals - 1; i >= 0; i--)
    {
-      double lowestLow = lowBuf[1];
-      for(int i = 2; i <= InpStructure_LB; i++)
-         if(lowBuf[i] < lowestLow) lowestLow = lowBuf[i];
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL)  != g_symbol)   continue;
+      if((long)HistoryDealGetInteger(ticket, DEAL_MAGIC) != InpMagicNumber) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
 
-      return lowestLow - realatr;
+      double profit = HistoryDealGetDouble(ticket, DEAL_PROFIT);
+
+      if(profit < 0)
+      {
+         g_consecutiveLosses++;
+         g_consecutiveWins = 0;
+      }
+      else if(profit > 0)
+      {
+         g_consecutiveWins++;
+         g_consecutiveLosses = 0;
+      }
+      break;
    }
-   else // SELL → shortstop = highest(high, LB) + realatr
-   {
-      double highestHigh = highBuf[1];
-      for(int i = 2; i <= InpStructure_LB; i++)
-         if(highBuf[i] > highestHigh) highestHigh = highBuf[i];
 
-      return highestHigh + realatr;
+   double newMult = 1.0;
+
+   if(g_consecutiveLosses >= InpAR_LossThreshold * 2)
+      newMult = InpAR_ReduceFactor * InpAR_ReduceFactor;
+   else if(g_consecutiveLosses >= InpAR_LossThreshold)
+      newMult = InpAR_ReduceFactor;
+   else if(g_consecutiveWins >= 2)
+      newMult = MathMin(InpAR_MaxBoost, 1.0 + (g_consecutiveWins - 1) * 0.1);
+
+   newMult = MathMax(0.25, MathMin(InpAR_MaxBoost, newMult));
+
+   if(MathAbs(newMult - g_currentRiskMult) > 0.01)
+   {
+      PrintFormat("[ADAPT RISK] Mult: %.2f → %.2f | Pertes consec: %d | Gains consec: %d",
+                  g_currentRiskMult, newMult, g_consecutiveLosses, g_consecutiveWins);
+      g_currentRiskMult = newMult;
    }
 }
 
 //+------------------------------------------------------------------+
 //| CALCUL LOT SELON MODE                                            |
-//| LOT_MODE_FIXED   : retourne InpLotSize                          |
-//| LOT_MODE_PERCENT : calcule le lot basé sur % du capital         |
-//|                                                                  |
-//| Formule XAUUSDm :                                               |
-//|   Risque$ = Capital × (RiskPercent / 100)                       |
-//|   Lot = Risque$ / (SL_points × 0.1)                            |
-//|   Exemple : Capital=300$, Risk=1%, SL=500pts                    |
-//|   Lot = (300×0.01) / (500×0.1) = 3 / 50 = 0.06                |
 //+------------------------------------------------------------------+
 double CalcLotSize(double slDist)
 {
    if(InpLotMode == LOT_MODE_FIXED)
       return InpLotSize;
 
-   // Calcul % risque
-   double capital   = AccountInfoDouble(ACCOUNT_BALANCE);
-   double riskMoney = capital * (InpRiskPercent / 100.0);
+   double capital      = AccountInfoDouble(ACCOUNT_BALANCE);
+   double effectiveRisk = InpRiskPercent * (InpUseAdaptiveRisk ? g_currentRiskMult : 1.0);
+   double riskMoney    = capital * (effectiveRisk / 100.0);
 
-   // SL en points
    double slPoints  = slDist / g_point;
    if(slPoints <= 0) return InpLotMin;
 
-   // Valeur d'1 g_point pour 1 lot sur XAUUSDm = 0.1$
-   double pointValue = 0.1;
-
-   // Lot calculé
+   double pointValue = 0.1; // XAUUSDm
    double lot = riskMoney / (slPoints * pointValue);
 
-   // Normaliser selon step du broker
    double lotStep = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
    lot = MathFloor(lot / lotStep) * lotStep;
 
-   // Appliquer limites min/max
    lot = MathMax(lot, InpLotMin);
    lot = MathMin(lot, InpLotMax);
 
-   PrintFormat("[LOT%%] Capital=%.2f$ Risk=%.1f%%=%.2f$ SL=%.0fpts → Lot=%.2f",
-               capital, InpRiskPercent, riskMoney, slPoints, lot);
+   PrintFormat("[LOT%%] Capital=%.2f$ Risk=%.1f%%×%.2f=%.2f$ SL=%.0fpts → Lot=%.2f",
+               capital, InpRiskPercent, (InpUseAdaptiveRisk ? g_currentRiskMult : 1.0),
+               riskMoney, slPoints, lot);
 
    return lot;
 }
