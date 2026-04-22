@@ -1,31 +1,7 @@
 """
 =============================================================
   TELEGRAM -> MT5  |  Bot Trading
-=============================================================
-  Formats signal supportés :
-    XAUUSD INSTANT BUY / Entry: 5177/5175 / TP1: 5181 / SL : 5168
-    GOLD SELL 5230/5233 / TP¹.5225 / SL ..5240
-    XAUUSD BUY 5215/5212 / TP 5218 / SL 5208
-    XAUUSD SELL 5194/5204 / 🎯TP 5191 / SL 5220
-    XAUUSD SELL NOW: (5416 5420) / 📊TAKE PROFIT: 1 (5412) / 👎STOP LOSS: (5429)
-
-  CAS 1 — Prix DANS la zone :
-    MARKET 0.01 → TP2  puis BE+Trail escalier
-    LIMIT  0.01 → TPfinal
-
-  CAS 2 — Prix HORS zone :
-    LIMIT 0.01 @high → TP2
-    LIMIT 0.01 @mid  → TP3
-    LIMIT 0.01 @low-(dist/3) → TPfinal  (BUY)
-
-  Trail SL en escalier :
-    TP2 atteint → SL = BE (entrée)
-    TP3 atteint → SL = TP1
-    TP4 atteint → SL = TP2
-    > TPfinal   → Trail en pips
-
-  News Forex Factory + Fenêtres horaires bloquées
-  SL MOVE → update immédiat toutes positions + ordres
+  PARTIE 1/5 : Imports, Config, Logging, Filtres, News, Reporter
 =============================================================
 """
 
@@ -43,6 +19,9 @@ import threading
 from telethon import TelegramClient, events
 import MetaTrader5 as mt5
 
+import gspread
+from google.oauth2.service_account import Credentials
+
 load_dotenv()
 
 # ------------------------------------------------------------------
@@ -52,6 +31,9 @@ API_ID            = int(os.getenv("TG_API_ID", "0"))
 API_HASH          = os.getenv("TG_API_HASH", "")
 CHANNEL_NAME      = os.getenv("TG_CHANNEL", "")
 CHANNEL_NAME_2    = os.getenv("TG_CHANNEL_2", "")
+CHANNEL_NAME_3    = os.getenv("TG_CHANNEL_3", "")
+CHANNEL_NAME_4    = os.getenv("TG_CHANNEL_4", "")
+REPORT_CHANNEL    = os.getenv("TG_REPORT_CHANNEL", "")
 
 MT5_LOGIN         = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD      = os.getenv("MT5_PASSWORD", "")
@@ -60,7 +42,9 @@ MT5_SERVER        = os.getenv("MT5_SERVER", "")
 MAGIC_NUMBER      = int(os.getenv("MAGIC_NUMBER", "20250226"))
 SLIPPAGE          = int(os.getenv("SLIPPAGE", "20"))
 ORDER_EXPIRY_MIN  = int(os.getenv("ORDER_EXPIRY_MINUTES", "240"))
-TRAIL_POINTS      = float(os.getenv("TRAIL_POINTS", "15"))
+TRAIL_POINTS      = float(os.getenv("TRAIL_POINTS", "150"))
+
+DEMO_MODE         = os.getenv("DEMO_MODE", "true").lower() == "true"
 
 NEWS_ENABLED      = os.getenv("NEWS_FILTER_ENABLED", "true").lower() == "true"
 NEWS_BLOCK_MIN    = int(os.getenv("NEWS_WINDOW_BEFORE_BLOCK", "15"))
@@ -70,9 +54,6 @@ NEWS_AFTER_MIN    = int(os.getenv("NEWS_WINDOW_AFTER", "15"))
 TIME_FILTER_ENABLED = os.getenv("TIME_FILTER_ENABLED", "true").lower() == "true"
 
 def _parse_blocked_windows(raw: str) -> list:
-    """Parse TIME_BLOCKED_WINDOWS depuis .env
-    Format : "13:00-15:00,16:30-17:30"
-    """
     windows = []
     for w in raw.split(","):
         w = w.strip()
@@ -94,11 +75,7 @@ BLOCKED_WINDOWS = _parse_blocked_windows(_raw_windows)
 #  LOGGING
 # ------------------------------------------------------------------
 class OrderFilter(logging.Filter):
-    """Filtre console : cache spam Telegram et cycles TradeManager."""
-    HIDE = [
-        "[SPAM]",
-        "[CYCLE]",
-    ]
+    HIDE = ["[SPAM]", "[CYCLE]"]
     def filter(self, record):
         msg = record.getMessage()
         for tag in self.HIDE:
@@ -115,26 +92,24 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-# Console handler avec filtre
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
 console_handler.addFilter(OrderFilter())
 log.addHandler(console_handler)
 
-
 # ------------------------------------------------------------------
 #  FILTRE MESSAGES NON-TRADING
 # ------------------------------------------------------------------
 EXCLUDE_KEYWORDS = [
-    "tp hit", "tp1 hit", "tp2 hit", "tp3 hit", "tp reached",
-    "all tp hit", "mission acomplished", "boom boom boom",
+    "tp hit", "tp1 hit", "tp2 hit", "tp3 "mission acomplished", "boom boom boom",
     "my signal are on fire", "pips profit", "pips gain",
     "target", "closed at", "exit at", "sl hit", "stopped",
     "secured", "hit target", "be safe", "good luck",
     "market update", "analysis", "running",
     "are you in big loss", "contact",
     "use proper money management",
-    "100% accurate", "consistency",
+    " hit", "tp reached",
+    "all tp hit",100% accurate", "consistency",
 ]
 
 def is_spam(text: str) -> bool:
@@ -144,12 +119,10 @@ def is_spam(text: str) -> bool:
             return True
     return False
 
-
 # ------------------------------------------------------------------
 #  GESTION FENÊTRES HORAIRES BLOQUÉES
 # ------------------------------------------------------------------
 def in_blocked_window() -> tuple[bool, str]:
-    """Retourne (True, description) si on est dans une fenêtre bloquée UTC."""
     if not TIME_FILTER_ENABLED:
         return False, ""
     now = datetime.now(timezone.utc)
@@ -162,7 +135,6 @@ def in_blocked_window() -> tuple[bool, str]:
             return True, desc
     return False, ""
 
-
 # ------------------------------------------------------------------
 #  GESTIONNAIRE DE NEWS
 # ------------------------------------------------------------------
@@ -172,7 +144,7 @@ class NewsManager:
 
     def __init__(self, bridge):
         self.bridge        = bridge
-        self.manager       = None  # sera set après création TradeManager
+        self.manager       = None
         self._news         = []
         self._blocked      = False
         self._blocked_until = None
@@ -193,7 +165,6 @@ class NewsManager:
                 self._check_news()
             except Exception as e:
                 log.error(f"NewsManager erreur: {e}")
-            # Vérifier toutes les 30 secondes pour réactivité
             for _ in range(30):
                 if self._stop:
                     break
@@ -217,38 +188,29 @@ class NewsManager:
         if not NEWS_ENABLED:
             return
         now = datetime.now(timezone.utc)
-
         for news in self._news:
             try:
                 news_time = datetime.fromisoformat(news["date"].replace("Z", "+00:00"))
             except Exception:
                 continue
-
             diff_minutes = (news_time - now).total_seconds() / 60
-
-            # T+NEWS_AFTER_MIN : débloquer
             if -NEWS_AFTER_MIN <= diff_minutes < 0 and self._blocked:
                 remaining = NEWS_AFTER_MIN + diff_minutes
                 if remaining <= 0:
                     self._blocked = False
                     log.info(f"[NEWS] {news.get('title','?')} terminé → reprise normale")
-
-            # T-NEWS_CLOSE_MIN : fermer positions + annuler ordres
             if 0 < diff_minutes <= NEWS_CLOSE_MIN:
                 if not self._blocked:
                     self._blocked = True
                     log.info(f"[NEWS] {news.get('title','?')} dans {diff_minutes:.0f} min → fermeture positions + annulation ordres")
                     if self.manager:
                         self._close_all()
-
-            # T-NEWS_BLOCK_MIN : bloquer nouveaux signaux
             elif NEWS_CLOSE_MIN < diff_minutes <= NEWS_BLOCK_MIN:
                 if not self._blocked:
                     self._blocked = True
                     log.info(f"[NEWS] {news.get('title','?')} dans {diff_minutes:.0f} min → nouveaux signaux bloqués")
 
     def _close_all(self):
-        """Annuler ordres + fermer positions avant news."""
         if self.manager:
             for entry in list(self.manager.active):
                 for o in entry.get("orders", []):
@@ -259,83 +221,224 @@ class NewsManager:
     def stop(self):
         self._stop = True
 
+# ------------------------------------------------------------------
+#  TRADE REPORTER — Google Sheets + Telegram
+# ------------------------------------------------------------------
+class TradeReporter:
 
-# ------------------------------------------------------------------
-#  PARSER DE SIGNAL
-# ------------------------------------------------------------------
+    def __init__(self):
+        self._tg_client  = None
+        self._report_entity = None
+        self._gsheet     = None
+        self._init_gsheet()
+
+    def _init_gsheet(self):
+        try:
+            scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+            creds = Credentials.from_service_account_file(
+                "google_credentials.json", scopes=scopes
+            )
+            gc = gspread.authorize(creds)
+            self._gsheet = gc.open("Trade Report").sheet1
+            log.info("Google Sheets connecté ✅")
+        except FileNotFoundError:
+            log.warning("google_credentials.json non trouvé — Google Sheets désactivé")
+        except Exception as e:
+            log.warning(f"Google Sheets non disponible : {e}")
+
+    async def set_telegram_client(self, client: TelegramClient):
+        self._tg_client = client
+        if REPORT_CHANNEL:
+            try:
+                self._report_entity = await client.get_entity(REPORT_CHANNEL)
+                log.info(f"Canal de rapport : {getattr(self._report_entity, 'title', REPORT_CHANNEL)}")
+            except Exception as e:
+                log.warning(f"Canal de rapport introuvable : {e}")
+                self._report_entity = None
+
+    def log_gsheet(self, canal, symbol, action, zone, sl, tp1, tp2,
+                   lot, ticket, event, pnl=""):
+        if self._gsheet:
+            try:
+                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._gsheet.append_row([
+                    now, canal, symbol, action,
+                    zone, str(sl), str(tp1), str(tp2),
+                    str(lot), str(ticket), event, str(pnl)
+                ])
+                log.info(f"[GSHEET] {symbol} {action} {event}")
+            except Exception as e:
+                log.error(f"Erreur Google Sheets : {e}")
+
+    async def send_tg(self, message: str):
+        if self._tg_client and self._report_entity:
+            try:
+                await self._tg_client.send_message(self._report_entity, message)
+            except Exception as e:
+                log.error(f"Erreur envoi rapport TG : {e}")
+
+    async def on_order_opened(self["tickets"]:
+            self.log_gsheet(canal, sig["symbol"], sig["action"], zone,
+                            sig["sl"], tp1_bot, tp2_bot,
+                            tk["lot"], tk["ticket"], "OUVERT")
+
+        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
+        msg = (
+            f"🟢 ORDRE OUVERT {mode_tag}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"📍 Zone : {zone}\n"
+            f"❌ SL : {sig['sl']}\n"
+            f"🎯 {tps_str}\n"
+            f"📦 Lot : 0.01 × {len(entry['tickets'])} position(s)\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
+
+    async def on_tp_reached(self, ticket, sig, tp_name, tp_value, pnl):
+        canal = sig.get("source_channel", "In ".join([f"TP{i+1}={v, entry):
+        sig   = entry["signal"]
+        canal = sig.get("source_channel", "Inconnu")
+        zone  = f"{sig['zone_low']}-{sig['zone_high']}"
+        all_tps = sig["tps"]
+        tp1_bot = all_tps[2] if len(all_tps) >= 3 else all_tps[-1]
+        tp2_bot = all_tps[-1]
+        tps_str = ",}" for i, v in enumerate(all_tps)])
+
+        for tk in entryconnu")
+        zone  = f"{sig['zone_low']}-{sig['zone_high']}"
+
+        self.log_gsheet(canal, sig["symbol"], sig["action"], zone,
+                        sig["sl"], "", "", 0.01, ticket,
+                        f"{tp_name} ATTEINT", f"{pnl:.2f}")
+
+        msg = (
+            f"🎯 {tp_name} ATTEINT\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"🎯 {tp_name} : {tp_value}\n"
+            f"💰 P&L : {pnl:+.2f} $\n"
+            f"🎫 Ticket : #{ticket}\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
+
+    async def on_sl_hit(self, ticket, sig, pnl):
+        canal = sig.get("source_channel", "Inconnu")
+        zone  = f"{sig['zone_low']}-{sig['zone_high']}"
+
+        self.log_gsheet(canal, sig["symbol"], sig["action"], zone,
+                        sig["sl"], "", "", 0.01, ticket,
+                        "SL TOUCHÉ", f"{pnl:.2f}")
+
+        msg = (
+            f"🔴 SL TOUCHÉ\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"📍 Zone : {zone}\n"
+            f"❌ SL : {sig['sl']}\n"
+            f"💸 P&L : {pnl:+.2f} $\n"
+            f"🎫 Ticket : #{ticket}\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
+
+    async def on_trade_closed(self, entry, total_pnl):
+        sig   = entry["signal"]
+        canal = sig.get("source_channel", "Inconnu")
+        zone  = f"{sig['zone_low']}-{sig['zone_high']}"
+        emoji = "✅" if total_pnl >= 0 else "❌"
+        all_tps = sig["tps"]
+        tp1_bot = all_tps[2] if len(all_tps) >= 3 else all_tps[-1]
+        tp2_bot = all_tps[-1]
+
+        self.log_gsheet(canal, sig["symbol"], sig["action"], zone,
+                        sig["sl"], tp1_bot, tp2_bot,
+                        0.01, "MULTI", "FERMÉ", f"{total_pnl:.2f}")
+
+        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
+        msg = (
+            f"{emoji} TRADE FERMÉ {mode_tag}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"📍 Zone : {zone}\n"
+            f"❌ SL : {sig['sl']}\n"
+            f"💰 P&L TOTAL : {total_pnl:+.2f} $\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
+"""
+=============================================================
+  TELEGRAM -> MT5  |  Bot Trading
+  PARTIE 2/5 : Signal Parser
+=============================================================
+"""
+
 class SignalParser:
 
     SYMBOL_MAP = {"GOLD": "XAUUSD", "SILVER": "XAGUSD", "OIL": "USOIL"}
 
-    # XAUUSD BUY 5215/5212  ou  XAUUSD INSTANT BUY\nEntry: 5177/5175
-    # XAUUSD SELL NOW: (5416 5420)
-    # Gold Buy 4898-         ou  Gold Buy NOW 4865 4862
     RE_MAIN = re.compile(
         r'(XAUUSD|GOLD|XAU/USD|XAGUSD|SILVER|USOIL|OIL)\s+(?:INSTANT\s+|NOW[:\s]*)?(?:INSTANT\s+)?(BUY|SELL)[^\d\n]{0,30}?'
-        r'(?:Entry:\s*)?\(?\s*([\d.]+)\s*[-/\s]\s*([\d.]+)?\s*\)?',
+        r'(?:Entry:\s*)?$$?\s*([\d.]+)\s*[-/\s]\s*([\d.]+)?\s*$$?',
         re.IGNORECASE
     )
 
-    # 🔴 SELL TRADE XAU/USD  (direction avant le symbole)
     RE_MAIN_ALT = re.compile(
         r'(BUY|SELL)\s+TRADE\s+(XAUUSD|GOLD|XAU/USD)',
         re.IGNORECASE
     )
 
-    # Zone seule sur ligne : 5009.5- 5012.0  ou  5009.5/5012.0
     RE_ZONE_LINE = re.compile(
         r'^\s*([\d.]+)\s*[-/]\s*([\d.]+)\s*$',
         re.MULTILINE
     )
 
-    # Target: open  → TPs automatiques
     RE_TARGET_OPEN = re.compile(
         r'Target\s*:\s*open',
         re.IGNORECASE
     )
 
-    # Stop Loss avec 📍 ou texte
     RE_SL_TARGET = re.compile(
         r'(?:📍\s*)?Stop\s+Loss\s*:\s*([\d.]+)',
         re.IGNORECASE
     )
 
-    # TP standard : TP1: 5181 / TP 5218 / 🎯TP 5191 / TP¹.5225
-    # TP court    : TP-4900 / TP-4910-max4925
     RE_TP = re.compile(
         r'(?:\U0001F3AF|\U0001F4CA|\u27A4|\u25BA|\u25B6)?\s*'
         r'TP[\u00b9\u00b2\u00b3\u2074\u2075\d]*[-.:]\s*([\d]{3,}(?:\.\d+)?)(?:-max[\d.]+)?',
         re.IGNORECASE
     )
 
-    # TAKE PROFIT: 1   (5412)  ou  TAKE PROFIT: 1  5412
-    # TAKE PROFIT. 4867        ou  TAKE PROFIT. 4870 CONFIRM✅
     RE_TP_LONG = re.compile(
-        r'TAKE\s+PROFIT\s*[:.]\s*(?:\d+\s+)?\(?\s*([\d]{4,}(?:\.\d+)?)\s*\)?(?:\s*CONFIRM\S*)?',
+        r'TAKE\s+PROFIT\s*[:.]\s*(?:\d+\s+)?$$?\s*([\d]{4,}(?:\.\d+)?)\s*$$?(?:\s*CONFIRM\S*)?',
         re.IGNORECASE
     )
 
-    # SL standard : SL : 5168 / 🔴SL ..5240
-    # SL triple   : SL---4995
     RE_SL = re.compile(
         r'(?:\U0001F534|\u274C|\U0001F6D1|\u26D4|\U0001F44E)?\s*'
         r'SL[-.\s]{0,5}([\d]{3,}(?:\.\d+)?)',
         re.IGNORECASE
     )
 
-    # STOP LOSS: (5429)  ou  STOP LOSS: 5429  ou  STOP LOSS. 4856
     RE_SL_LONG = re.compile(
-        r'STOP\s+LOSS\s*[:.]\s*\(?\s*([\d]{3,}(?:\.\d+)?)\s*\)?',
+        r'STOP\s+LOSS\s*[:.]\s*$$?\s*([\d]{3,}(?:\.\d+)?)\s*$$?',
         re.IGNORECASE
     )
 
-    # SL MOVE / MOVE SL / New SL / SL → / SL moved to
     RE_SL_MOVE = re.compile(
         r'(?:SL\s*MOVE|MOVE\s*SL|New\s*SL|SL\s*\u2192|SL\s*moved?\s*to)\s*[:\s]*\s*([\d.]+)',
         re.IGNORECASE
     )
 
-    # SL seul sur une ligne
     RE_SL_ALONE = re.compile(
         r'^\s*(?:\U0001F534|\u274C|\U0001F6D1)?\s*SL\s*[.:\s]+\s*([\d]{3,}(?:\.\d+)?)\s*$',
         re.IGNORECASE | re.MULTILINE
@@ -343,32 +446,102 @@ class SignalParser:
 
     RE_CLOSE = re.compile(r'close\s+(all|[A-Z]{3,10})', re.IGNORECASE)
 
+    RE_DAILY_ACTION = re.compile(
+        r'(XAUUSD|GOLD|XAU/USD|XAGUSD|SILVER|USOIL|OIL)\s+DAILY\s+SIGNAL',
+        re.IGNORECASE
+    )
+    RE_DAILY_ACTION_DIR = re.compile(r'Action\s*:\s*(BUY|SELL)', re.IGNORECASE)
+    RE_DAILY_ENTRY = re.compile(r'Entry\s+Price\s*\n\s*([\d.]+)\s*[-/\s]\s*([\d.]+)', re.IGNORECASE)
+    RE_DAILY_TP = re.compile(r'TP\d+\s*:\s*([\d.]+)', re.IGNORECASE)
+    RE_DAILY_SL = re.compile(r'Stop\s+Loss\s*(?:$$SL$$)?\s*:\s*([\d.]+)', re.IGNORECASE)
+
+    RE_TAKE_PROFITE = re.compile(
+        r'TAKE\s+PROFITE?\s*:\s*\d+\s*$$\s*([\d.]+)\s*$$',
+        re.IGNORECASE
+    )
+
+    RE_TP_LINE = re.compile(
+        r'^\s*TP\s+([\d.]+)\s*$',
+        re.IGNORECASE | re.MULTILINE
+    )
+
+    def _build_result(self, symbol, action, zone_low, zone_mid, zone_high, tps, sl):
+        return {
+            "type": "TRADE", "symbol": symbol, "action": action,
+            "zone_low": zone_low, "zone_mid": zone_mid, "zone_high": zone_high,
+            "tps": tps,
+            "tp1": tps[0],
+            "tp2": tps[1] if len(tps) >= 2 else tps[-1],
+            "tp3": tps[2] if len(tps) >= 3 else tps[-1],
+            "tp4": tps[3] if len(tps) >= 4 else tps[-1],
+            "tp_final": tps[-1], "sl": sl,
+        }
+
     def parse(self, text: str) -> dict | None:
 
-        # 1. CLOSE
         close_m = self.RE_CLOSE.search(text.upper())
         if close_m:
             target = close_m.group(1).upper()
-            return {
-                "type":      "CLOSE",
-                "symbol":    None if target == "ALL" else target,
-                "close_all": target == "ALL",
-            }
+            return {"type": "CLOSE", "symbol": None if target == "ALL" else target, "close_all": target == "ALL"}
 
-        # 2. SL MOVE (avant filtre spam car "moved to" peut être dans un signal)
         sl_move_m = self.RE_SL_MOVE.search(text)
         if sl_move_m:
             return {"type": "SL_MOVE", "new_sl": float(sl_move_m.group(1))}
 
-        # 3. Filtre spam
+        # DAILY SIGNAL
+        daily_m = self.RE_DAILY_ACTION.search(text)
+        if daily_m:
+            action_m = self.RE_DAILY_ACTION_DIR.search(text)
+            entry_m  = self.RE_DAILY_ENTRY.search(text)
+            sl_m     = self.RE_DAILY_SL.search(text)
+            tp_vals  = [float(v) for v in self.RE_DAILY_TP.findall(text)]
+
+            if action_m and entry_m and tp_vals and sl_m:
+                symbol    = self.SYMBOL_MAP.get(daily_m.group(1).upper(), daily_m.group(1).upper())
+                action    = action_m.group(1).upper()
+                price_a   = float(entry_m.group(1))
+                price_b   = float(entry_m.group(2))
+                zone_low  = min(price_a, price_b)
+                zone_high = max(price_a, price_b)
+                zone_mid  = round((zone_low + zone_high) / 2, 2)
+                sl        = float(sl_m.group(1))
+                log.info(f"Signal DAILY → {action} {symbol} zone [{zone_low}—{zone_mid}—{zone_high}] ({len(tp_vals)} TPs)")
+                return self._build_result(symbol, action, zone_low, zone_mid, zone_high, tp_vals, sl)
+            else:
+                log.warning(f"DAILY SIGNAL incomplet | {text[:80]}")
+                return None
+
+        # TAKE PROFITE
+        tp_profite_vals = self.RE_TAKE_PROFITE.findall(text)
+        if tp_profite_vals:
+            main_m = self.RE_MAIN.search(text)
+            if main_m:
+                symbol    = self.SYMBOL_MAP.get(main_m.group(1).upper(), main_m.group(1).upper())
+                action    = main_m.group(2).upper()
+                price_a   = float(main_m.group(3))
+                price_b   = float(main_m.group(4)) if main_m.group(4) else price_a
+                zone_low  = min(price_a, price_b)
+                zone_high = max(price_a, price_b)
+                zone_mid  = round((zone_low + zone_high) / 2, 2)
+                tps       = [float(v) for v in tp_profite_vals]
+                sl_m      = self.RE_SL_LONG.search(text) or self.RE_SL.search(text)
+                sl        = float(sl_m.group(1)) if sl_m else None
+
+                if not tps or sl is None:
+                    log.warning(f"TAKE PROFITE incomplet | {text[:80]}")
+                    return None
+
+                log.info(f"Signal TAKE PROFITE → {action} {symbol} zone [{zone_low}—{zone_mid}—{zone_high}] ({len(tps)} TPs)")
+                return self._build_result(symbol, action, zone_low, zone_mid, zone_high, tps, sl)
+
+        # Filtre spam
         if is_spam(text):
             log.debug(f"[SPAM] Message filtré: {text[:60].replace(chr(10),' ')}")
             return None
 
-        # 4. BUY / SELL
+        # BUY / SELL standards
         main_m = self.RE_MAIN.search(text)
 
-        # Format alternatif : "🔴 SELL TRADE XAU/USD \n 5009.5- 5012.0"
         if not main_m:
             alt_m = self.RE_MAIN_ALT.search(text)
             if alt_m:
@@ -382,37 +555,21 @@ class SignalParser:
                     zone_high = max(price_a, price_b)
                     zone_mid  = round((zone_low + zone_high) / 2, 2)
 
-                    # SL
                     sl_m = self.RE_SL_TARGET.search(text) or self.RE_SL_LONG.search(text) or self.RE_SL.search(text)
                     sl   = float(sl_m.group(1)) if sl_m else None
-
                     if sl is None:
                         log.warning(f"Format TRADE — SL manquant | {text[:80]}")
                         return None
 
-                    # TPs automatiques si "Target: open"
                     tps = []
                     if self.RE_TARGET_OPEN.search(text):
                         step = 4.0
                         base = zone_high if action == "BUY" else zone_low
                         if action == "SELL":
-                            tps = [
-                                round(base - step,     2),   # TP1
-                                round(base - step * 2, 2),   # TP2
-                                round(base - step * 3, 2),   # TP3
-                            ]
-                        else:  # BUY
-                            tps = [
-                                round(base + step,     2),   # TP1
-                                round(base + step * 2, 2),   # TP2
-                                round(base + step * 3, 2),   # TP3
-                            ]
-                        log.info(
-                            f"Target:open → TPs auto générés (step=$4) "
-                            f"TP1={tps[0]} TP2={tps[1]} TP3={tps[2]} TP4=Trail"
-                        )
+                            tps = [round(base-step,2), round(base-step*2,2), round(base-step*3,2)]
+                        else:
+                            tps = [round(base+step,2), round(base+step*2,2), round(base+step*3,2)]
                     else:
-                        # TPs explicites dans le message
                         for val in self.RE_TP.findall(text):
                             try: tps.append(float(val))
                             except ValueError: pass
@@ -425,128 +582,43 @@ class SignalParser:
                         log.warning(f"Format TRADE — TPs manquants | {text[:80]}")
                         return None
 
-                    tp1      = tps[0]
-                    tp2      = tps[1] if len(tps) >= 2 else tps[-1]
-                    tp3      = tps[2] if len(tps) >= 3 else tps[-1]
-                    tp4      = tps[3] if len(tps) >= 4 else tps[-1]
-                    tp_final = tps[-1]   # TP4 = trail (laisser courir)
-
-                    log.info(
-                        f"Signal TRADE → {action} {symbol} "
-                        f"zone [{zone_low}—{zone_mid}—{zone_high}] "
-                        f"TP1={tp1} TP2={tp2} TP3={tp3} TP4=Trail SL={sl}"
-                    )
-
-                    return {
-                        "type":      "TRADE",
-                        "symbol":    symbol,
-                        "action":    action,
-                        "zone_low":  zone_low,
-                        "zone_mid":  zone_mid,
-                        "zone_high": zone_high,
-                        "tps":       tps,
-                        "tp1":       tp1,
-                        "tp2":       tp2,
-                        "tp3":       tp3,
-                        "tp4":       tp4,
-                        "tp_final":  tp_final,
-                        "sl":        sl,
-                    }
+                    return self._build_result(symbol, action, zone_low, zone_mid, zone_high, tps, sl)
 
         if not main_m:
             sl_alone = self.RE_SL_ALONE.search(text)
             if sl_alone:
                 return {"type": "SL_MOVE", "new_sl": float(sl_alone.group(1))}
+
+            # Multi-TP
+            tp_line_vals = self.RE_TP_LINE.findall(text)
+            if tp_line_vals:
+                first_line = text.strip().split('\n')[0]
+                sym_m = re.search(r'(XAUUSD|GOLD|XAU/USD|XAGUSD|SILVER|USOIL|OIL)', first_line, re — TPs={.IGNORECASE)
+                dir_m = re_b)
+                    zone_mid  = round((zone_low + zone_high) / 2, 2)
+
+                    sl_line_m = re.search(r'^\s*SL\s+([\d.]+)', text, re.IGNORECASE | re.MULTILINE)
+                    sl = float(sl_line_m.group(1)) if sl_line_m else None
+                    tps = [float(v) for v in tp_line_vals]
+
+                    if not tps or sl is None:
+                        log.warning(f"Multi-TP incomplet | {text[:80]}")
+                        return None
+
+                    return self._build_result(symboltps} SL={sl} | {text[:80]}")
             return None
 
-        symbol  = self.SYMBOL_MAP.get(main_m.group(1).upper(), main_m.group(1).upper())
-        action  = main_m.group(2).upper()
-        price_a = float(main_m.group(3))
-        price_b = float(main_m.group(4))
+        log.info(f"Signal parsé → {action} {symbol} zone [{zone_low}—{zone_mid}—{zone_high}] TPfinal={tps[-1]} SL={sl} ({len(tps)} TPs)")
 
-        zone_low  = min(price_a, price_b)
-        zone_high = max(price_a, price_b)
-        zone_mid  = round((zone_low + zone_high) / 2, 2)
+        return self._build_result(symbol, action, zone_low, zone_mid, zone_high, tps, sl)
 
-        # TPs : essayer les deux formats
-        tps = []
-        for val in self.RE_TP.findall(text):
-            try:
-                tps.append(float(val))
-            except ValueError:
-                pass
-        if not tps:
-            for val in self.RE_TP_LONG.findall(text):
-                try:
-                    tps.append(float(val))
-                except ValueError:
-                    pass
+"""
+=============================================================
+  TELEGRAM -> MT5  |  Bot Trading
+  PARTIE 3/5 : MT5 Bridge, Conflit, Exécution Signal
+=============================================================
+"""
 
-        # SL : essayer les deux formats
-        sl_m = self.RE_SL.search(text)
-        if not sl_m:
-            sl_m = self.RE_SL_LONG.search(text)
-        sl = float(sl_m.group(1)) if sl_m else None
-
-        if not tps or sl is None:
-            log.warning(f"Signal incomplet — TPs={tps} SL={sl} | {text[:80]}")
-            return None
-
-        # Calcul des niveaux internes
-        # TP1 du signal est toujours disponible
-        tp1 = tps[0]
-
-        if len(tps) == 3:
-            # TP1 → tp2 bot, TP2 ignoré, TP3 → tp_final
-            # tp3 et tp4 générés entre TP1 et TP3
-            tp2      = tps[0]
-            tp_final = tps[2]
-            distance = abs(tp_final - tp2)
-            step     = distance / 3
-            if tp2 > tp_final:  # SELL
-                tp3 = round(tp2 - step,     2)
-                tp4 = round(tp2 - step * 2, 2)
-            else:               # BUY
-                tp3 = round(tp2 + step,     2)
-                tp4 = round(tp2 + step * 2, 2)
-            log.info(
-                f"3 TPs → TP1={tp2}(seuil BE) "
-                f"tp3={tp3}(généré) tp4={tp4}(généré) "
-                f"TPfinal={tp_final} | TP2 signal ignoré"
-            )
-        else:
-            tp2      = tps[1] if len(tps) >= 2 else tps[-1]
-            tp3      = tps[2] if len(tps) >= 3 else tps[-1]
-            tp4      = tps[3] if len(tps) >= 4 else tps[-1]
-            tp_final = tps[-1]
-
-        log.info(
-            f"Signal parsé → {action} {symbol} "
-            f"zone [{zone_low}—{zone_mid}—{zone_high}] "
-            f"TP1={tp1} TP2={tp2} TP3={tp3} TP4={tp4} TPfinal={tp_final} SL={sl} "
-            f"({len(tps)} TPs)"
-        )
-
-        return {
-            "type":      "TRADE",
-            "symbol":    symbol,
-            "action":    action,
-            "zone_low":  zone_low,
-            "zone_mid":  zone_mid,
-            "zone_high": zone_high,
-            "tps":       tps,
-            "tp1":       tp1,
-            "tp2":       tp2,
-            "tp3":       tp3,
-            "tp4":       tp4,
-            "tp_final":  tp_final,
-            "sl":        sl,
-        }
-
-
-# ------------------------------------------------------------------
-#  BRIDGE MT5
-# ------------------------------------------------------------------
 class MT5Bridge:
 
     _sym_cache: dict = {}
@@ -585,91 +657,55 @@ class MT5Bridge:
     def _sym(self, symbol: str):
         if symbol in self._sym_cache:
             return mt5.symbol_info(self._sym_cache[symbol])
-
         info = mt5.symbol_info(symbol)
         if info is None:
             for sfx in ["m", "m+", ".a", "pro", "+", ".", "z", "micro", "#", ""]:
-                candidate = symbol + sfx
-                info = mt5.symbol_info(candidate)
-                if info:
-                    log.info(f"Symbole résolu : {symbol} → {candidate}")
-                    break
+                candidate = symbol + sfx.search(r'\b(BUY|SELL)\b', first_line, re.IGNORECASE)
+                zone_m = self.RE_ZONE_LINE.search(first_line)
 
-        if info is None and symbol.endswith("m"):
-            info = mt5.symbol_info(symbol[:-1])
-            if info:
-                log.info(f"Symbole résolu : {symbol} → {symbol[:-1]}")
+                if sym_m and dir_m and zone_m:
+                    symbol    = self.SYMBOL_MAP.get(sym_m.group(1).upper(), sym_m.group(1).upper())
+                    action    = dir_m.group(1).upper()
+                    price_a   = float(zone_m.group(1))
+                    price_b   = float(zone_m.group(2))
+                    zone_low  = min(price_a, price_b)
+                    zone_high = max(price_a, price, action, zone_low, zone_mid, zone_high, tps, sl)
 
-        if info is None:
-            all_syms = mt5.symbols_get()
-            if all_syms:
-                matches = [s for s in all_syms if s.name.upper().startswith(symbol.upper()[:6])]
-                if matches:
-                    info = matches[0]
-                    log.info(f"Symbole trouvé par recherche : {info.name}")
-
-        if info is None:
-            log.error(f"Symbole introuvable : {symbol}")
             return None
 
-        self._sym_cache[symbol] = info.name
+        # Formats standards
+        symbol  = self.SYMBOL_MAP.get(main_m.group(1).upper(), main_m.group(1).upper())
+        action  = main_m.group(2).upper()
+        price_a = float(main_m.group(3))
+        price_b = float(main_m.group(4))
 
-        if not info.visible:
-            mt5.symbol_select(info.name, True)
-            time.sleep(0.5)
+        zone_low  = min(price_a, price_b)
+        zone_high = max(price_a, price_b)
+        zone_mid  = round((zone_low + zone_high) / 2, 2)
 
-        return mt5.symbol_info(info.name)
+        tps = []
+        for val in self.RE_TP.findall(text):
+            try: tps.append(float(val))
+            except ValueError: pass
+        if not tps:
+            for val in self.RE_TP_LONG.findall(text):
+                try: tps.append(float(val))
+                except ValueError: pass
 
-    def current_price(self, symbol: str, action: str) -> float | None:
-        sym_info = self._sym(symbol)
-        if sym_info is None:
-            return None
-        tick = mt5.symbol_info_tick(sym_info.name)
-        if not tick:
-            return None
-        return tick.ask if action == "BUY" else tick.bid
+        sl_m = self.RE_SL.search(text)
+        if not sl_m:
+            sl_m = self.RE_SL_LONG.search(text)
+        sl = float(sl_m.group(1)) if sl_m else None
 
-    def place_market_order(self, signal: dict, lot: float, tp: float) -> int | None:
-        sym = self._sym(signal["symbol"])
-        if not sym:
-            return None
-        action     = signal["action"]
-        tick       = mt5.symbol_info_tick(sym.name)
-        if not tick:
-            log.error(f"Tick introuvable pour {sym.name}")
-            return None
-        price      = tick.ask if action == "BUY" else tick.bid
-        order_type = mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
-
-        result = mt5.order_send({
-            "action":       mt5.TRADE_ACTION_DEAL,
-            "symbol":       sym.name,
-            "volume":       lot,
-            "type":         order_type,
-            "price":        price,
-            "sl":           round(signal["sl"], sym.digits),
-            "tp":           round(tp, sym.digits),
-            "deviation":    SLIPPAGE,
-            "magic":        MAGIC_NUMBER,
-            "comment":      f"TG-market {datetime.now():%H:%M}",
-            "type_time":    mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        })
-
-        if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-            log.info(f"MARKET {action} {sym.name} lot={lot} @{price} ticket#{result.order}")
-            return result.order
-        log.error(f"Market échoué | retcode={result.retcode if result else 'N/A'}")
-        return None
-
-    def place_limit_order(self, signal: dict, lot: float, price: float,
+        if not tps or sl is None:
+            log.warning(f"Signal incomplet
+                info = def place_limit_order(self, signal: dict, lot: float, price: float,
                           tp: float, expiry: datetime) -> int | None:
         sym = self._sym(signal["symbol"])
         if not sym:
             return None
-        action     = signal["action"]
+        action = signal["action"]
 
-        # Vérifier que le TP est valide
         if action == "BUY" and tp <= price:
             log.warning(f"LIMIT BUY ignoré @{price} — TP={tp} <= prix d'entrée")
             return None
@@ -773,9 +809,7 @@ class MT5Bridge:
         return result and result.retcode == mt5.TRADE_RETCODE_DONE
 
     def update_sl_all(self, new_sl: float):
-        """SL MOVE : met à jour SL sur toutes les positions ET ordres limits."""
         updated = 0
-
         positions = mt5.positions_get()
         if positions:
             for pos in positions:
@@ -828,11 +862,13 @@ class MT5Bridge:
             if pos.magic == MAGIC_NUMBER:
                 self.close_position(pos.ticket, comment="close-all")
 
-
 # ------------------------------------------------------------------
 #  DÉTECTION DE CONFLIT
 # ------------------------------------------------------------------
 def check_conflict(signal: dict, bridge: MT5Bridge, manager) -> bool:
+    if DEMO_MODE:
+        return False
+
     symbol     = signal["symbol"]
     new_action = signal["action"]
     opposite   = "SELL" if new_action == "BUY" else "BUY"
@@ -850,14 +886,15 @@ def check_conflict(signal: dict, bridge: MT5Bridge, manager) -> bool:
 
     if not conflict:
         for entry in manager.active:
-            if entry["signal"]["symbol"] == symbol and entry["signal"]["action"] == opposite:
+            if entry["signal"]["symbol"] == symbol and \
+               entry["signal"]["action"] == opposite:
                 conflict = True
                 break
 
     if not conflict:
         return False
 
-    log.warning(f"CONFLIT {symbol} : entrant={new_action} existant={opposite} → tout fermé, signal ignoré")
+    log.warning(f"CONFLIT {symbol} : entrant={new_action} existant={opposite}")
 
     to_remove = []
     for entry in manager.active:
@@ -873,7 +910,6 @@ def check_conflict(signal: dict, bridge: MT5Bridge, manager) -> bool:
     bridge.close_all(symbol=symbol)
     return True
 
-
 # ------------------------------------------------------------------
 #  EXÉCUTION DU SIGNAL
 # ------------------------------------------------------------------
@@ -883,10 +919,11 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager):
     zone_low  = signal["zone_low"]
     zone_mid  = signal["zone_mid"]
     zone_high = signal["zone_high"]
-    tp1       = signal["tp1"]
-    tp2       = signal["tp2"]
-    tp3       = signal["tp3"]
-    tp_final  = signal["tp_final"]
+
+    all_tps   = signal["tps"]
+    tp1       = all_tps[2] if len(all_tps) >= 3 else all_tps[-1]
+    tp2       = all_tps[-1]
+    tp_final  = all_tps[-1]
     sl        = signal["sl"]
     expiry    = datetime.now() + timedelta(minutes=ORDER_EXPIRY_MIN)
 
@@ -905,120 +942,85 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager):
 
     in_zone = zone_low <= current <= zone_high
 
+    canal = signal.get("source_channel", "Inconnu")
+    mode  = "DEMO" if DEMO_MODE else "LIVE"
     log.info("=" * 55)
-    log.info(f"SIGNAL {action} {symbol}")
+    log.info(f"SIGNAL [{mode}] {action} {symbol} | Canal: {canal}")
     log.info(f"Zone [{zone_low} — {zone_mid} — {zone_high}] | Prix={current}")
     log.info(f"{'DANS la zone → CAS 1' if in_zone else 'HORS zone → CAS 2'}")
-    log.info(f"TP1={tp1} TP2={tp2} TP3={tp3} TPfinal={tp_final} SL={sl}")
+    log.info(f"TP1={tp1} (seuil BE) | TP2={tp2} (trail) | SL={sl}")
     log.info("=" * 55)
 
     orders  = []
     tickets = []
 
     if in_zone:
-        # ── CAS 1 ─────────────────────────────────────────────────
+        # CAS 1
         t1 = bridge.place_market_order(signal, 0.01, tp=tp2)
         if t1:
             tickets.append({
-                "ticket":         t1,
-                "lot":            0.01,
-                "role":           "market",
-                "entry_price":    current,
-                "tp1":            tp1,
-                "tp2":            tp2,
-                "tp3":            tp3,
-                "tp4":            signal["tp4"],
-                "tp_final":       tp_final,
-                # Escalier BE
-                "sl_step":        0,   # 0=initial 1=BE 2=TP1 3=TP2 4=trail
-                "trail_active":   False,
-                "limit_executed": False,
+                "ticket":        t1,
+                "lot":           0.01,
+                "role":          "market",
+                "entry_price":   current,
+                "signal_tp1":    signal["tp1"],
+                "tp1":           tp1,
+                "tp2":           tp2,
+                "sl_step":       0,
+                "trail_active":  False,
             })
 
         limit_price = zone_high if action == "SELL" else zone_low
-        o1 = bridge.place_limit_order(signal, 0.01, limit_price, tp_final, expiry)
+        o1 = bridge.place_limit_order(signal, 0.01, limit_price, tp2, expiry)
         if o1:
             orders.append({
-                "order":       o1,
-                "lot":         0.01,
-                "price":       limit_price,
-                "role":        "limit_cas1",
-                "tp1":         tp1,
-                "tp2":         tp2,
-                "tp3":         tp3,
-                "tp4":         signal["tp4"],
-                "tp_final":    tp_final,
-                "sl_step":     0,
-                "trail_active": False,
+                "order":         o1,
+                "lot":           0.01,
+                "price":         limit_price,
+                "role":          "limit_cas1",
+                "signal_tp1":    signal["tp1"],
+                "tp1":           tp1,
+                "tp2":           tp2,
+                "sl_step":       0,
+                "trail_active":  False,
             })
 
-        log.info(f"CAS 1 → MARKET 0.01 TP={tp2} | LIMIT 0.01 @{limit_price} TP={tp_final}")
+        log.info(f"CAS 1 → MARKET 0.01 TP={tp2} | LIMIT 0.01 @{limit_price} TP={tp2}")
 
     else:
-        # ── CAS 2 ─────────────────────────────────────────────────
-        # BUY  : 1er exécuté = zone_high, meilleur prix = zone_low
-        # SELL : 1er exécuté = zone_low,  meilleur prix = zone_high
-
-        # Prix du 3ème ordre = limite zone + 1/3 de la distance vers le SL
+        # CAS 2
         if action == "BUY":
-            dist_to_sl = zone_low - sl
-            price_3rd  = round(zone_low - dist_to_sl / 3, sym_info.digits)
-            orders_def = [
-                {"price": zone_high, "tp": tp2,      "role": "limit_high"},
-                {"price": zone_mid,  "tp": tp3,      "role": "limit_mid"},
-                {"price": price_3rd, "tp": tp_final, "role": "limit_low"},
+            dist_to_sl  = zone_low - sl
+            price_adj   = round(zone_low - dist_to_sl / 3, sym_info.digits)
+            orders_def  = [
+                {"price": zone_high, "tp": tp2, "role": "limit_high"},
+                {"price": price_adj, "tp": tp2, "role": "limit_low"},
             ]
-        else:  # SELL
-            dist_to_sl = sl - zone_high
-            price_3rd  = round(zone_high + dist_to_sl / 3, sym_info.digits)
-            orders_def = [
-                {"price": price_3rd, "tp": tp_final, "role": "limit_high"},
-                {"price": zone_mid,  "tp": tp3,      "role": "limit_mid"},
-                {"price": zone_low,  "tp": tp2,      "role": "limit_low"},
+        else:
+            dist_to_sl  = sl - zone_high
+            price_adj   = round(zone_high + dist_to_sl / 3, sym_info.digits)
+            orders_def  = [
+                {"price": zone_low,  "tp": tp2, "role": "limit_low"},
+                {"price": price_adj, "tp": tp2, "role": "limit_high"},
             ]
 
         for od in orders_def:
             o = bridge.place_limit_order(signal, 0.01, od["price"], od["tp"], expiry)
             if o:
                 orders.append({
-                    "order":       o,
-                    "lot":         0.01,
-                    "price":       od["price"],
-                    "role":        od["role"],
-                    "tp1":         tp1,
-                    "tp2":         tp2,
-                    "tp3":         tp3,
-                    "tp4":         signal["tp4"],
-                    "tp_final":    tp_final,
-                    "sl_step":     0,
+                    "order":        o,
+                    "lot":          0.01,
+                    "price":        od["price"],
+                    "role":         od["role"],
+                    "signal_tp1":   signal["tp1"],
+                    "tp1":          tp1,
+                    "tp2":          tp2,
+                    "sl_step":      0,
                     "trail_active": False,
                 })
 
-        log.info(
-            f"CAS 2 → "
-            + " | ".join(f"LIMIT @{od['price']} TP={od['tp']} ({od['role']})" for od in orders_def)
-        )
-
-        # Rebond info
-        tp2_sig = signal["tp2"]
-        tp3_sig = signal["tp3"]
-        if action == "BUY":
-            seuil_bas    = tp2_sig if current >= tp2_sig else None
-            seuil_rebond = tp3_sig
-        else:
-            seuil_bas    = tp2_sig if current <= tp2_sig else None
-            seuil_rebond = tp3_sig
-
-        rebond_info = {
-            "actif":        True,
-            "seuil_bas":    seuil_bas,
-            "seuil_rebond": seuil_rebond,
-            "bas_touche":   seuil_bas is None,
-        }
-        log.info(
-            f"Rebond surveillé — seuil_bas={seuil_bas} seuil_rebond={seuil_rebond} "
-            f"(bas_touche={'oui' if rebond_info['bas_touche'] else 'non'})"
-        )
+        log.info(f"CAS 2 → " + " | ".join(
+            f"LIMIT @{od['price']} TP={od['tp']} ({od['role']})" for od in orders_def))
 
     if not orders and not tickets:
         log.error("Aucun ordre placé.")
@@ -1029,29 +1031,32 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager):
         "orders":      orders,
         "tickets":     tickets,
         "expiry":      expiry,
-        "rebond_info": rebond_info if not in_zone else {"actif": False},
+        "_open_date":  datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     })
+"""
+=============================================================
+  TELEGRAM -> MT5  |  Bot Trading
+  PARTIE 4/5 : Trade Manager
+=============================================================
+"""
 
-
-# ------------------------------------------------------------------
-#  TRADE MANAGER
-# ------------------------------------------------------------------
 class TradeManager:
 
-    def __init__(self, bridge: MT5Bridge):
-        self.bridge  = bridge
-        self.active  = []
-        self._stop   = False
-        self._thread = threading.Thread(target=self._loop, daemon=True)
+    def __init__(self, bridge: MT5Bridge, reporter: TradeReporter):
+        self.bridge   = bridge
+        self.reporter = reporter
+        self.active   = []
+        self._stop    = False
+        self._thread  = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
 
     def register(self, entry: dict):
         self.active.append(entry)
         sig = entry["signal"]
-        log.info(
-            f"TradeManager: {sig['action']} {sig['symbol']} enregistré | "
-            f"{len(entry['orders'])} ordres | {len(entry['tickets'])} market"
-        )
+        canal = sig.get("source_channel", "Inconnu")
+        mode  = "DEMO" if DEMO_MODE else "LIVE"
+        log.info(f"TradeManager [{mode}]: {sig['action']} {sig['symbol']} enregistré | "
+                 f"Canal: {canal} | {len(entry['orders'])} ordres | {len(entry['tickets'])} market")
 
     def stop(self):
         self._stop = True
@@ -1064,6 +1069,15 @@ class TradeManager:
                 self._check_all()
             except Exception as exc:
                 log.error(f"TradeManager erreur: {exc}")
+
+    def _get_last_pnl(self, ticket: int, symbol: str) -> float:
+        since = datetime.now() - timedelta(hours=24)
+        deals = mt5.history_deals_get(since, datetime.now(), group=symbol)
+        if deals:
+            for deal in reversed(deals):
+                if deal.position_id == ticket:
+                    return deal.profit
+        return 0.0
 
     def _check_all(self):
         now       = datetime.now()
@@ -1084,23 +1098,14 @@ class TradeManager:
                         "lot":          o["lot"],
                         "role":         o["role"],
                         "entry_price":  pos.price_open,
+                        "signal_tp1":   o.get("signal_tp1", 0),
                         "tp1":          o["tp1"],
                         "tp2":          o["tp2"],
-                        "tp3":          o["tp3"],
-                        "tp4":          o["tp4"],
-                        "tp_final":     o["tp_final"],
                         "sl_step":      0,
                         "trail_active": False,
                     }
                     entry["tickets"].append(tk)
                     log.info(f"Ordre #{o['order']} rempli → ticket={pos.ticket} @{pos.price_open} ({o['role']})")
-
-                    # CAS 1 : LIMIT exécuté → signaler au MARKET
-                    if o["role"] == "limit_cas1":
-                        for t in entry["tickets"]:
-                            if t.get("role") == "market":
-                                t["limit_executed"] = True
-                                log.info(f"LIMIT CAS1 exécuté → MARKET #{t['ticket']} : sera fermé au TP2")
 
                 elif now > entry["expiry"]:
                     self.bridge.cancel_order(o["order"])
@@ -1109,7 +1114,6 @@ class TradeManager:
                     still_pending.append(o)
             entry["orders"] = still_pending
 
-            # Vérifier s'il reste quelque chose
             active_tks = [t for t in entry["tickets"] if self._get_pos(t["ticket"])]
             if not entry["orders"] and not active_tks:
                 to_remove.append(entry)
@@ -1125,109 +1129,103 @@ class TradeManager:
                 continue
             current = tick.bid if action == "BUY" else tick.ask
 
-            # ── 3. Rebond CAS 2 ────────────────────────────────────
-            ri = entry.get("rebond_info", {})
-            if ri.get("actif") and not entry["tickets"]:
-                seuil_bas    = ri["seuil_bas"]
-                seuil_rebond = ri["seuil_rebond"]
-
-                if not ri["bas_touche"] and seuil_bas is not None:
-                    if (action == "BUY"  and current <= seuil_bas) or \
-                       (action == "SELL" and current >= seuil_bas):
-                        ri["bas_touche"] = True
-                        log.info(f"Rebond ({symbol}) — seuil bas {seuil_bas} touché")
-
-                if ri["bas_touche"]:
-                    rebond = (action == "BUY"  and current >= seuil_rebond) or \
-                             (action == "SELL" and current <= seuil_rebond)
-                    if rebond:
-                        log.info(f"Rebond confirmé ({symbol}) prix={current} > TP3={seuil_rebond} → annulation ordres")
-                        for o in entry["orders"]:
-                            self.bridge.cancel_order(o["order"])
-                        entry["orders"] = []
-                        to_remove.append(entry)
-                        continue
-
-            # ── 4. Gestion BE escalier + Trail ────────────────────
+            # ── 3. Gestion CAS 1 + CAS 2 + Trail ──────────────────
             for t in entry["tickets"]:
                 pos = self._get_pos(t["ticket"])
                 if pos is None:
                     continue
 
-                ep       = t.get("entry_price") or pos.price_open
-                tp1_t    = t.get("tp1", ep)
-                tp2_t    = t.get("tp2")
-                tp3_t    = t.get("tp3")
-                tp4_t    = t.get("tp4")
-                tp_final = t.get("tp_final")
-                sl_step  = t.get("sl_step", 0)
+                ep           = t.get("entry_price") or pos.price_open
+                signal_tp1   = t.get("signal_tp1", 0)
+                tp1_t        = t.get("tp1")
+                tp2_t        = t.get("tp2")
+                sl_step      = t.get("sl_step", 0)
+                role         = t.get("role", "")
 
-                # ─ CAS 1 MARKET : logique TP2 inversée ────────────
-                if t.get("role") == "market" and sl_step == 0 and tp2_t:
-                    tp2_reached = (action == "BUY"  and current >= tp2_t) or \
-                                  (action == "SELL" and current <= tp2_t)
-                    if tp2_reached:
-                        if not t.get("limit_executed", False):
-                            # LIMIT non exécuté → MARKET passe BE + Trail
+                # CAS 1 : MARKET — TP1 atteint
+                if role == "market" and sl_step == 0 and tp1_t:
+                    tp1_reached = (action == "BUY"  and current >= tp1_t) or \
+                                  (action == "SELL" and current <= tp1_t)
+                    if tp1_reached:
+                        limit_ticket = next(
+                            (tk for tk in entry["tickets"] if tk.get("role") == "limit_cas1"),
+                            None
+                        )
+
+                        if limit_ticket is None:
+                            self.bridge.modify_sl(t["ticket"], ep, label="[BE CAS1 Scén1]")
                             t["sl_step"]      = 1
-                            t["trail_active"] = False  # trail déclenché à tp4
-                            self.bridge.modify_sl(t["ticket"], ep, label="[BE CAS1 market→trail]")
-                            # Annuler le LIMIT
-                            for o in entry["orders"]:
-                                if o.get("role") == "limit_cas1":
-                                    self.bridge.cancel_order(o["order"])
-                                    log.info(f"TP2 atteint → LIMIT annulé, MARKET passe BE+Trail")
+                            t["trail_active"] = True
+                            limit_order = next(
+                                (o for o in entry["orders"] if o.get("role") == "limit_cas1"),
+                                None
+                            )
+                            if limit_order:
+                                self.bridge.cancel_order(limit_order["order"])
+                                entry["orders"] = [o for o in entry["orders"] if o.get("role") != "limit_cas1"]
+                            log.info(f"CAS1 Scén1 #{t['ticket']} → BE ({ep}) + Trail | LIMIT annulé")
+
                         else:
-                            # LIMIT exécuté → MARKET fermé au TP2
-                            self.bridge.close_position(t["ticket"], comment="TP2-CAS1")
-                            log.info(f"TP2 atteint → MARKET #{t['ticket']} fermé (LIMIT actif)")
+                            self.bridge.close_position(t["ticket"], comment="CAS1-Scén2-TP1")
+                            if self._get_pos(limit_ticket["ticket"]):
+                                self.bridge.modify_sl(limit_ticket["ticket"], signal_tp1, label="[BE CAS1 Scén2]")
+                                limit_ticket["sl_step"]      = 1
+                                limit_ticket["trail_active"] = True
+                                log.info(f"CAS1 Scén2 → MARKET #{t['ticket']} fermé | LIMIT #{limit_ticket['ticket']} → BE ({signal_tp1}) + Trail")
+                            else:
+                                log.info(f"CAS1 Scén2 → MARKET #{t['ticket']} fermé | LIMIT pas encore exécuté")
                         continue
 
-                # ─ Escalier BE pour tous les autres tickets ────────
-                if sl_step == 0 and tp2_t:
-                    reached = (action == "BUY"  and current >= tp2_t) or \
-                              (action == "SELL" and current <= tp2_t)
-                    if reached:
-                        ok = self.bridge.modify_sl(t["ticket"], ep, label="[BE étape1 @entrée]")
-                        if ok:
-                            t["sl_step"] = 1
-                            log.info(f"Escalier BE #{t['ticket']} : SL → entrée {ep}")
+                # CAS 2 : 1er ordre — TP1 atteint
+                trigger_role = "limit_high" if action == "BUY" else "limit_low"
+                if role == trigger_role and sl_step == 0 and tp1_t:
+                    tp1_reached = (action == "BUY"  and current >= tp1_t) or \
+                                  (action == "SELL" and current <= tp1_t)
+                    if tp1_reached:
+                        other_role = "limit_low" if action == "BUY" else "limit_high"
+                        other_ticket = next(
+                            (tk for tk in entry["tickets"] if tk.get("role") == other_role),
+                            None
+                        )
 
-                elif sl_step == 1 and tp3_t:
-                    reached = (action == "BUY"  and current >= tp3_t) or \
-                              (action == "SELL" and current <= tp3_t)
-                    if reached:
-                        ok = self.bridge.modify_sl(t["ticket"], tp1_t, label="[BE étape2 @TP1]")
-                        if ok:
-                            t["sl_step"] = 2
-                            log.info(f"Escalier BE #{t['ticket']} : SL → TP1 {tp1_t}")
+                        if other_ticket is None:
+                            self.bridge.modify_sl(t["ticket"], ep, label="[BE CAS2 Scén1]")
+                            t["sl_step"]      = 1
+                            t["trail_active"] = True
+                            other_order = next(
+                                (o for o in entry["orders"] if o.get("role") == other_role),
+                                None
+                            )
+                            if other_order:
+                                self.bridge.cancel_order(other_order["order"])
+                                entry["orders"] = [o for o in entry["orders"] if o.get("role") != other_role]
+                            log.info(f"CAS2 Scén1 #{t['ticket']} ({role}) → BE ({ep}) + Trail | {other_role} annulé")
 
-                elif sl_step == 2 and tp4_t:
-                    reached = (action == "BUY"  and current >= tp4_t) or \
-                              (action == "SELL" and current <= tp4_t)
-                    if reached:
-                        ok = self.bridge.modify_sl(t["ticket"], tp2_t, label="[BE étape3 @TP2]")
-                        if ok:
-                            t["sl_step"]      = 3
-                            t["trail_active"] = False  # sera activé à TPfinal
-                            log.info(f"Escalier BE #{t['ticket']} : SL → TP2 {tp2_t}")
+                        else:
+                            self.bridge.close_position(t["ticket"], comment="CAS2-Scén2-TP1")
+                            if self._get_pos(other_ticket["ticket"]):
+                                self.bridge.modify_sl(other_ticket["ticket"], signal_tp1, label="[BE CAS2 Scén2]")
+                                other_ticket["sl_step"]      = 1
+                                other_ticket["trail_active"] = True
+                                log.info(f"CAS2 Scén2 → {role} #{t['ticket']} fermé | {other_role} #{other_ticket['ticket']} → BE ({signal_tp1}) + Trail")
+                            else:
+                                log.info(f"CAS2 Scén2 → {role} #{t['ticket']} fermé | {other_role} pas encore exécuté")
+                        continue
 
-                elif sl_step == 3 and tp_final:
-                    reached = (action == "BUY"  and current >= tp_final) or \
-                              (action == "SELL" and current <= tp_final)
-                    if reached:
-                        t["sl_step"]      = 4
-                        t["trail_active"] = True
-                        log.info(f"Trail activé #{t['ticket']} — dépassé TPfinal {tp_final}")
-
-                # ─ Trail SL dynamique (en pips) ───────────────────
+                # Trail actif
                 if t.get("trail_active"):
                     pos_live = self._get_pos(t["ticket"])
                     if pos_live:
                         sym2 = mt5.symbol_info(pos_live.symbol)
                         if sym2 is None:
                             continue
-                        trail_gap = TRAIL_POINTS * sym2.point * 10
+                        digits = sym2.digits
+                        if digits == 3 or digits == 5:
+                            pip_value = 10 * sym2.point
+                        else:
+                            pip_value = sym2.point
+                        trail_gap = TRAIL_POINTS * pip_value
+
                         if action == "BUY":
                             new_sl = current - trail_gap
                             if new_sl > pos_live.sl:
@@ -1237,87 +1235,37 @@ class TradeManager:
                             if new_sl < pos_live.sl or pos_live.sl == 0:
                                 self.bridge.modify_sl(t["ticket"], new_sl, label="[Trail SELL]")
 
-            # ── 5. CAS 2 : scénarios A/B/C quand 1er ordre atteint TP2
-            self._handle_cas2_scenarios(entry, action, symbol, current)
+            # ── 4. Détecter fermetures pour reporter ───────────────
+            for t in entry.get("tickets", []):
+                pos = self._get_pos(t["ticket"])
+                if pos is None and not t.get("_reported"):
+                    t["_reported"] = True
+                    pnl = self._get_last_pnl(t["ticket"], symbol)
+                    t["_last_pnl"] = pnl
 
-            # ── 6. Trade terminé ──────────────────────────────────
+                    if t.get("sl_step", 0) >= 1:
+                        asyncio.ensure_future(
+                            self.reporter.on_tp_reached(t["ticket"], sig, "Trail/TP", t.get("tp2", 0), pnl)
+                        )
+                    else:
+                        asyncio.ensure_future(
+                            self.reporter.on_sl_hit(t["ticket"], sig, pnl)
+                        )
+
+            # ── 5. Trade terminé ──────────────────────────────────
             active_tks = [t for t in entry["tickets"] if self._get_pos(t["ticket"])]
             if not entry["orders"] and not active_tks:
-                log.info(f"Trade terminé ({symbol})")
+                total_pnl = sum(t.get("_last_pnl", 0.0) for t in entry["tickets"])
+                canal = sig.get("source_channel", "Inconnu")
+                log.info(f"Trade terminé ({symbol}) | Canal: {canal} | P&L total: {total_pnl:+.2f}")
+                asyncio.ensure_future(
+                    self.reporter.on_trade_closed(entry, total_pnl)
+                )
                 to_remove.append(entry)
 
         for e in to_remove:
             if e in self.active:
                 self.active.remove(e)
-
-    def _handle_cas2_scenarios(self, entry, action, symbol, current):
-        """Gère les scénarios A/B/C du CAS 2 quand le 1er ordre atteint TP2."""
-        sig = entry["signal"]
-
-        # Chercher le 1er ordre exécuté (limit_high BUY / limit_low SELL)
-        trigger_role = "limit_high" if action == "BUY" else "limit_low"
-        trigger_tk   = next((t for t in entry["tickets"] if t.get("role") == trigger_role), None)
-        if not trigger_tk:
-            return
-
-        # Déjà traité
-        if trigger_tk.get("cas2_done"):
-            return
-
-        tp2_t = trigger_tk.get("tp2")
-        if not tp2_t:
-            return
-
-        tp2_reached = (action == "BUY"  and current >= tp2_t) or \
-                      (action == "SELL" and current <= tp2_t)
-        if not tp2_reached:
-            return
-
-        trigger_tk["cas2_done"] = True
-
-        mid_tk     = next((t for t in entry["tickets"] if t.get("role") == "limit_mid"), None)
-        other_role = "limit_low" if action == "BUY" else "limit_high"
-        other_tk   = next((t for t in entry["tickets"] if t.get("role") == other_role), None)
-        sym        = self.bridge._sym(symbol)
-
-        if not mid_tk and not other_tk:
-            # Scénario A : seul le 1er rempli
-            for o in entry["orders"]:
-                if o.get("role") in ["limit_mid", other_role]:
-                    self.bridge.cancel_order(o["order"])
-            # 1er passe BE + trail (déjà géré par escalier)
-            log.info(f"ScénA ({symbol}) → 1er seul rempli, mid+other annulés")
-
-        elif mid_tk and not other_tk:
-            # Scénario B : 1er + mid
-            for o in entry["orders"]:
-                if o.get("role") == other_role:
-                    self.bridge.cancel_order(o["order"])
-            # 1er fermé au TP2
-            self.bridge.close_position(trigger_tk["ticket"], comment="ScénB-TP2")
-            # mid passe BE
-            if sym and self._get_pos(mid_tk["ticket"]):
-                mid_ep = mid_tk.get("entry_price", mid_tk.get("tp2", 0))
-                self.bridge.modify_sl(mid_tk["ticket"], mid_ep, label="[BE ScénB]")
-                mid_tk["sl_step"] = 1
-            log.info(f"ScénB ({symbol}) → 1er fermé TP2, mid BE+continue")
-
-        elif mid_tk and other_tk:
-            # Scénario C : les 3 remplis
-            # 1er fermé au TP2
-            self.bridge.close_position(trigger_tk["ticket"], comment="ScénC-TP2")
-            # mid passe BE + TP3
-            if sym and self._get_pos(mid_tk["ticket"]):
-                mid_ep = mid_tk.get("entry_price", mid_tk.get("tp2", 0))
-                self.bridge.modify_sl(mid_tk["ticket"], mid_ep, label="[BE ScénC mid]")
-                mid_tk["sl_step"] = 1
-            # other passe BE + trail
-            if sym and self._get_pos(other_tk["ticket"]):
-                other_ep = other_tk.get("entry_price", other_tk.get("tp2", 0))
-                self.bridge.modify_sl(other_tk["ticket"], other_ep, label="[BE ScénC other]")
-                other_tk["sl_step"]      = 1
-                other_tk["trail_active"] = False  # trail à TPfinal
-            log.info(f"ScénC ({symbol}) → 1er fermé TP2, mid BE+TP3, other BE+trail")
 
     def _get_pos(self, ticket: int):
         r = mt5.positions_get(ticket=ticket)
@@ -1334,48 +1282,62 @@ class TradeManager:
                 if positions:
                     return positions[0]
         return None
+"""
+=============================================================
+  TELEGRAM -> MT5  |  Bot Trading
+  PARTIE 5/5 : Main
+=============================================================
+"""
 
-
-# ------------------------------------------------------------------
-#  MAIN
-# ------------------------------------------------------------------
 async def main():
-    parser  = SignalParser()
-    bridge  = MT5Bridge()
-    manager = None
+    parser   = SignalParser()
+    bridge   = MT5Bridge()
+    reporter = TradeReporter()
+    manager  = None
 
     if not bridge.connect():
         log.critical("Bot arrêté — corrigez MT5 puis relancez.")
         return
 
-    manager     = TradeManager(bridge)
-    news_mgr    = NewsManager(bridge)
+    manager  = TradeManager(bridge, reporter)
+    news_mgr = NewsManager(bridge)
     news_mgr.set_manager(manager)
 
     client = TelegramClient("session_trading", API_ID, API_HASH)
     await client.start()
     log.info("Telegram connecté.")
 
-    entity1 = await client.get_entity(CHANNEL_NAME)
-    log.info(f"Canal 1 : {getattr(entity1, 'title', CHANNEL_NAME)}")
+    await reporter.set_telegram_client(client)
 
-    entity2 = None
-    if CHANNEL_NAME_2:
+    # ── Résoudre les 4 canaux ────────────────────────────────────
+    chats = []
+    channel_names = [
+        ("TG_CHANNEL", CHANNEL_NAME),
+        ("TG_CHANNEL_2", CHANNEL_NAME_2),
+        ("TG_CHANNEL_3", CHANNEL_NAME_3),
+        ("TG_CHANNEL_4", CHANNEL_NAME_4),
+    ]
+
+    entity_to_name = {}
+
+    for env_name, ch_value in channel_names:
+        if not ch_value:
+            continue
         try:
-            entity2 = await client.get_entity(CHANNEL_NAME_2)
-            log.info(f"Canal 2 : {getattr(entity2, 'title', CHANNEL_NAME_2)}")
+            entity = await client.get_entity(ch_value)
+            title = getattr(entity, "title", ch_value)
+            chats.append(entity)
+            entity_to_name[entity.id] = title
+            log.info(f"Canal : {title} ({env_name}={ch_value})")
         except Exception as e:
-            log.warning(f"Canal 2 introuvable ({CHANNEL_NAME_2}) : {e}")
-
-    chats = [entity1] + ([entity2] if entity2 else [])
+            log.warning(f"Canal introuvable ({env_name}={ch_value}) : {e}")
 
     @client.on(events.NewMessage(chats=chats))
     async def handler(event):
         text       = event.message.text or ""
         chat       = await event.get_chat()
-        canal_name = getattr(chat, "title", "inconnu")
+        canal_name = entity_to_name.get(chat.id, getattr(chat, "title", "inconnu"))
 
-        # Filtre spam console
         if is_spam(text):
             log.debug(f"[SPAM] [{canal_name}] {text[:60].replace(chr(10),' ')}")
             return
@@ -1386,6 +1348,8 @@ async def main():
         if signal is None:
             return
 
+        signal["source_channel"] = canal_name
+
         if signal["type"] == "CLOSE":
             bridge.close_all(symbol=signal.get("symbol"))
 
@@ -1394,25 +1358,32 @@ async def main():
             bridge.update_sl_all(signal["new_sl"])
 
         elif signal["type"] == "TRADE":
-            # Vérifier fenêtre horaire bloquée
             blocked, desc = in_blocked_window()
             if blocked:
                 log.info(f"[TIME] Signal ignoré — fenêtre bloquée {desc}")
                 return
 
-            # Vérifier news
             if NEWS_ENABLED and news_mgr.is_blocked():
                 log.info(f"[NEWS] Signal ignoré — protection news active")
                 return
 
             execute_signal(signal, bridge, manager)
 
+            for entry in manager.active:
+                if entry["signal"] is signal:
+                    await reporter.on_order_opened(entry)
+                    break
+
+    mode = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
     log.info("=" * 55)
-    log.info("   BOT ACTIF")
-    log.info(f"   Canal 1 : {CHANNEL_NAME}")
-    if CHANNEL_NAME_2:
-        log.info(f"   Canal 2 : {CHANNEL_NAME_2}")
-    log.info(f"   Trail SL : {TRAIL_POINTS} pips après TPfinal")
+    log.info(f"   BOT ACTIF — {mode}")
+    log.info(f"   Canaux surveillés : {len(chats)}")
+    for env_name, ch_value in channel_names:
+        if ch_value:
+            log.info(f"     {env_name} : {ch_value}")
+    if REPORT_CHANNEL:
+        log.info(f"   Canal de rapport : {REPORT_CHANNEL}")
+    log.info(f"   Trail SL : {TRAIL_POINTS} pts")
     log.info(f"   News filter : {'ON' if NEWS_ENABLED else 'OFF'}")
     log.info(f"   Time filter : {'ON' if TIME_FILTER_ENABLED else 'OFF'}")
     log.info("=" * 55)
