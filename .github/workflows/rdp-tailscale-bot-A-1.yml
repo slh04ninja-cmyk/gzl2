@@ -101,7 +101,6 @@ permissions:
 defaults:
   run:
     shell: pwsh
-
 jobs:
   setup:
     runs-on: ubuntu-latest
@@ -303,7 +302,7 @@ jobs:
           $ver = & python --version 2>&1
           Write-Host "Version finale : $ver"
           "PYTHON_OK=1" | Out-File -Append $env:GITHUB_ENV
-      - name: Install Python libs (avec gspread)
+              - name: Install Python libs (avec gspread)
         run: |
           $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
           $userPath    = [System.Environment]::GetEnvironmentVariable("Path", "User")
@@ -383,7 +382,7 @@ jobs:
               Write-Host "$f ignore : $($_.Exception.Message)"
             }
           }
-      - name: Setup TradingBot (4 canaux + Google Sheets + Demo Mode)
+              - name: Setup TradingBot (4 canaux + Google Sheets + Demo Mode)
         env:
           GH_TOKEN:                  ${{ github.token }}
           BOT_REPO:                  ${{ inputs.bot_repo }}
@@ -488,7 +487,7 @@ jobs:
           Write-Host "  Sur le Bureau : double-cliquez"
           Write-Host "  'Lancer Bot Trading'"
           Write-Host "========================================"
-      - name: Keep alive
+              - name: Keep alive
         run: |
           $mins = [int]"$env:RUNTIME_MINUTES"
           $end  = (Get-Date).AddMinutes($mins)
@@ -563,3 +562,4 @@ jobs:
             Write-Host "Pas de cycle configure. Termine."
           }
           
+        
