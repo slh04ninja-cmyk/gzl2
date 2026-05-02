@@ -17,8 +17,8 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
+SUPABASE_KEY = st.secrets.get("SUPABASE_ANON_KEY", "")
 
 
 @st.cache_resource
