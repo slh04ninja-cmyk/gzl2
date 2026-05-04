@@ -1,8 +1,15 @@
 """
 =============================================================
  TELEGRAM → MT5 | Bot Trading
- Version 4.3 — CAS 1 fix + CAS 2: 2 limits TP=TP_final, code gère fermeture/BE/trailing à TP2
+ Version 4.3.2 — MT5 path fix + diagnostic logs + TradeReporter fix
 =============================================================
+ Changements v4.3.2 (2026-05-05) :
+ - FIX: MT5Bridge.connect() — cherche terminal64.exe et passe path à mt5.initialize()
+   Résout erreur -10003 (terminal introuvable)
+ - FIX: TradeReporter forward reference (type hint string)
+ - NEW: Logs diagnostic pour signaux rejetés silencieusement (symbole/prix)
+ - NEW: Logs détaillés si MT5 initialization échoue
+
  Changements v4.1 :
  - FIX: _parse_main() group(4) optionnel (évite TypeError)
  - FIX: datetime naive vs aware (duree_min maintenant correct)
