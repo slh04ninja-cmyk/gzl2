@@ -568,22 +568,7 @@ class MT5Bridge:
     _sym_cache: dict = {}
 
     def connect(self) -> bool:
-        # Trouver terminal64.exe pour mt5.initialize()
-        mt5_path = None
-        for p in [
-            r"C:\Program Files\MetaTrader 5\terminal64.exe",
-            r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
-        ]:
-            if os.path.exists(p):
-                mt5_path = p
-                break
-
-        init_kwargs = {}
-        if mt5_path:
-            init_kwargs["path"] = mt5_path
-            log.info(f"MT5 terminal: {mt5_path}")
-
-        if mt5.initialize(**init_kwargs):
+        if mt5.initialize():
             info = mt5.account_info()
             if info and info.login > 0:
                 log.info(
@@ -594,8 +579,7 @@ class MT5Bridge:
         mt5.shutdown()
 
         if not mt5.initialize(
-            login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER,
-            **init_kwargs
+            login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER
         ):
             log.error(f"MT5 initialize failed: {mt5.last_error()}")
             return False
