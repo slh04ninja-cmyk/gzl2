@@ -384,32 +384,7 @@ class MT5Bridge:
     _sym_cache: dict = {}
 
     def connect(self) -> bool:
-        # Trouver le chemin du terminal MT5
-        import glob as _glob
-        mt5_path = None
-        search_paths = [
-            r"C:\Program Files\MetaTrader 5\terminal64.exe",
-            r"C:\Program Files (x86)\MetaTrader 5\terminal64.exe",
-        ]
-        for p in search_paths:
-            if os.path.exists(p):
-                mt5_path = p
-                break
-        if not mt5_path:
-            found = _glob.glob(r"C:\*terminal64.exe", recursive=False)
-            if not found:
-                found = _glob.glob(r"C:\**\terminal64.exe", recursive=True)
-            if found:
-                mt5_path = found[0]
-
-        if not mt5_path:
-            log.error("MT5 terminal64.exe introuvable — MT5 est-il installé ?")
-            return False
-
-        log.info(f"MT5 terminal trouvé: {mt5_path}")
-
-        # Essayer connexion directe (terminal déjà lancé)
-        if mt5.initialize(path=mt5_path):
+        if mt5.initialize():
             info = mt5.account_info()
             if info and info.login > 0:
                 log.info(
@@ -419,13 +394,10 @@ class MT5Bridge:
                 return self._check_algo()
         mt5.shutdown()
 
-        # Connexion avec identifiants
         if not mt5.initialize(
-            path=mt5_path, login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER
+            login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER
         ):
-            err = mt5.last_error()
-            log.error(f"MT5 initialize failed: {err}")
-            log.error(f"Vérifiez: 1) MT5 installé 2) Login/Password/Server corrects 3) Algo Trading activé")
+            log.error(f"MT5 initialize failed: {mt5.last_error()}")
             return False
 
         info = mt5.account_info()
