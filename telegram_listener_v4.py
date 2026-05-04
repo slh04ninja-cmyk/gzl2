@@ -820,10 +820,12 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
 
     sym_info = bridge._sym(symbol)
     if sym_info is None:
+        log.error(f"Signal rejeté — symbole introuvable dans MT5: {symbol}")
         return
 
     current = bridge.current_price(sym_info.name, action)
     if current is None:
+        log.error(f"Signal rejeté — prix indisponible pour {sym_info.name} (action={action})")
         return
 
     avg_entry = (zone_low + zone_high) / 2
