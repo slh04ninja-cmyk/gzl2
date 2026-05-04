@@ -354,7 +354,11 @@ jobs:
           $env:Path    = "$machinePath;$userPath"
           python -m pip install --upgrade pip -q
 
-          # Essayer de télécharger requirements.txt depuis le repo (API Contents)
+          # ── Dépendances du BOT (toujours requises) ──
+          Write-Host "Installation des dépendances du bot..."
+          python -m pip install telethon MetaTrader5 python-dotenv -q
+
+          # ── Dépendances du DASHBOARD (depuis requirements.txt si dispo) ──
           $repo     = $env:BOT_REPO
           $headers  = @{ 
             Authorization = "Bearer $env:GH_TOKEN"
@@ -364,13 +368,14 @@ jobs:
           $reqFile   = "$env:TEMP\requirements.txt"
           try {
             Invoke-WebRequest -Uri "$apiBase/requirements.txt" -OutFile $reqFile -Headers $headers -ErrorAction Stop
-            Write-Host "requirements.txt téléchargé — installation..."
+            Write-Host "requirements.txt téléchargé — installation des deps dashboard..."
             python -m pip install -r $reqFile -q
           } catch {
-            Write-Host "requirements.txt non trouvé — installation des libs de base..."
-            python -m pip install telethon MetaTrader5 python-dotenv supabase streamlit-autorefresh -q
+            Write-Host "requirements.txt non trouvé — installation des deps dashboard par défaut..."
+            python -m pip install supabase streamlit plotly pandas streamlit-autorefresh -q
           }
-          python -c "import telethon, MetaTrader5, dotenv, supabase; print('Python libs OK')"
+          python -c "import telethon, MetaTrader5, dotenv; print('Bot deps OK ✓')"
+          python -c "import supabase; print('Supabase OK ✓')"
 
       # ── RustDesk ──
       - name: Install RustDesk
@@ -390,17 +395,25 @@ jobs:
           Start-Sleep -Seconds 5
 
       # ── MT5 Exness ──
-      - name: Download MT5 Exness
+      - name: Install MT5 Exness
         run: |
           try {
-            $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
-            $mt5Dest = "$desktop\exness5setup.exe"
             $mt5Url = "https://download.terminal.free/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe"
+            $mt5Exe = "$env:TEMP\exness5setup.exe"
             Write-Host "Téléchargement MT5 Exness..."
-            Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Dest -TimeoutSec 120 -ErrorAction Stop
-            Write-Host "MT5 téléchargé sur le Bureau : $mt5Dest"
+            Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Exe -TimeoutSec 120 -ErrorAction Stop
+            Write-Host "MT5 téléchargé — installation silencieuse..."
+            Start-Process -FilePath $mt5Exe -ArgumentList "/S" -Wait -ErrorAction Stop
+            Remove-Item $mt5Exe -Force -EA SilentlyContinue
+            Write-Host "MT5 Exness installé ✓"
           } catch {
-            Write-Host "MT5 download ignoré : $($_.Exception.Message)"
+            Write-Host "MT5 install warning: $($_.Exception.Message)"
+            # Fallback: copier sur le Bureau pour install manuelle
+            $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+            if (Test-Path "$env:TEMP\exness5setup.exe") {
+              Copy-Item "$env:TEMP\exness5setup.exe" "$desktop\exness5setup.exe" -Force
+              Write-Host "MT5 setup copié sur le Bureau (install manuelle requise)"
+            }
           }
 
       # ── Setup TradingBot V4 ──
@@ -438,21 +451,25 @@ jobs:
           }
           $apiBase = "https://api.github.com/repos/$repo/contents"
 
-          try {
-            $url = "$apiBase/telegram_listener_v4.py"
-            Invoke-WebRequest -Uri $url -OutFile "$botDir\telegram_listener_v4.py" -Headers $headers -ErrorAction Stop
-            Write-Host "telegram_listener_v4.py téléchargé (API GitHub)"
-          } catch {
-            Write-Warning "Impossible de télécharger telegram_listener_v4.py : $($_.Exception.Message)"
-          }
-
-          # ── Télécharger supabase_logger.py ──
-          try {
-            $url = "$apiBase/supabase_logger.py"
-            Invoke-WebRequest -Uri $url -OutFile "$botDir\supabase_logger.py" -Headers $headers -ErrorAction Stop
-            Write-Host "supabase_logger.py téléchargé (API GitHub)"
-          } catch {
-            Write-Warning "Impossible de télécharger supabase_logger.py : $($_.Exception.Message)"
+          # ── Télécharger tous les fichiers du bot ──
+          $botFiles = @(
+            "telegram_listener_v4.py",
+            "signal_parser.py",
+            "supabase_logger.py",
+            "dashboard.py",
+            "requirements.txt"
+          )
+          foreach ($file in $botFiles) {
+            try {
+              $url = "$apiBase/$file"
+              Invoke-WebRequest -Uri $url -OutFile "$botDir\$file" -Headers $headers -ErrorAction Stop
+              Write-Host "$file téléchargé ✓"
+            } catch {
+              Write-Warning "Impossible de télécharger $file : $($_.Exception.Message)"
+              if ($file -in @("telegram_listener_v4.py", "signal_parser.py")) {
+                Write-Error "FICHIER CRITIQUE MANQUANT: $file — le bot ne peut pas démarrer!"
+              }
+            }
           }
 
           # ── Créer le fichier .env ──
@@ -535,6 +552,29 @@ jobs:
           Write-Host " Sur le Bureau : double-cliquez"
           Write-Host " 'Lancer Bot Trading V4'"
           Write-Host "========================================"
+
+      # ── Vérification avant démarrage ──
+      - name: Verify bot files
+        run: |
+          $botDir = "C:\TradingBot"
+          $required = @("telegram_listener_v4.py", "signal_parser.py", "supabase_logger.py", ".env")
+          $ok = $true
+          foreach ($f in $required) {
+            $path = Join-Path $botDir $f
+            if (Test-Path $path) {
+              $size = (Get-Item $path).Length
+              Write-Host "✓ $f ($size bytes)"
+            } else {
+              Write-Error "✗ MANQUANT: $f"
+              $ok = $false
+            }
+          }
+          if (-not $ok) {
+            Write-Error "Fichiers critiques manquants — le bot va crasher!"
+            exit 1
+          }
+          # Test import rapide
+          python -c "import sys; sys.path.insert(0, '$botDir'); from signal_parser import SignalParser; print('Import signal_parser OK ✓')"
 
       # ── Keep Alive ──
       - name: Keep alive
