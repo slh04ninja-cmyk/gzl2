@@ -14,6 +14,15 @@
  - DEL: Filtre horaire désactivé temporairement
 """
 
+# ── Auto-install des dépendances manquantes ──
+import subprocess, sys
+_deps = {"dotenv": "python-dotenv", "telethon": "telethon", "MetaTrader5": "MetaTrader5"}
+for _mod, _pkg in _deps.items():
+    try:
+        __import__(_mod)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", _pkg, "-q"])
+
 import asyncio
 import re
 import logging
