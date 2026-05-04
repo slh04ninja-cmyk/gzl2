@@ -826,7 +826,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         return
 
     tick = mt5.symbol_info_tick(sym_info.name)
-    if tick:
+    if tick and not DEMO_MODE:
         spread_points = abs(tick.ask - tick.bid)
         spread_pips = spread_points / sym_info.point
         if spread_pips > MAX_SPREAD_POINTS:
