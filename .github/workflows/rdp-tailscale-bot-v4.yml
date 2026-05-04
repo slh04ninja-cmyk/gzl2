@@ -394,77 +394,16 @@ jobs:
           Start-Process -FilePath $rdExe -EA SilentlyContinue
           Start-Sleep -Seconds 5
 
-      # ── MT5 Exness ──
-      - name: Install MT5 Exness
+      # ── MT5 Exness (téléchargement sur Bureau, install manuelle) ──
+      - name: Download MT5 Exness
         run: |
           $mt5Url = "https://download.terminal.free/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe"
-          $mt5Exe = "$env:TEMP\exness5setup.exe"
-          $timeoutSec = 300  # 5 minutes max
-
-          try {
-            Write-Host "Téléchargement MT5 Exness..."
-            Invoke-WebRequest -Uri $mt5Url -OutFile $mt5Exe -TimeoutSec 120 -ErrorAction Stop
-            $size = (Get-Item $mt5Exe).Length / 1MB
-            Write-Host "MT5 téléchargé ($([math]::Round($size,1)) MB) — installation silencieuse..."
-
-            $proc = Start-Process -FilePath $mt5Exe -ArgumentList "/S" -PassThru -ErrorAction Stop
-            Write-Host "PID du processus MT5: $($proc.Id)"
-
-            # Monitor avec timeout
-            $elapsed = 0
-            while (-not $proc.HasExited -and $elapsed -lt $timeoutSec) {
-              Start-Sleep -Seconds 10
-              $elapsed += 10
-              $cpu = $proc.CPU
-              $mem = [math]::Round($proc.WorkingSet64 / 1MB, 1)
-              Write-Host "  [${elapsed}s] En cours... CPU=$cpu Mem=${mem}MB"
-            }
-
-            if (-not $proc.HasExited) {
-              Write-Host "[TIMEOUT] MT5 pas terminé après ${timeoutSec}s — kill du processus"
-              $proc | Stop-Process -Force -EA SilentlyContinue
-              throw "Installation MT5 timeout après ${timeoutSec}s"
-            }
-
-            Write-Host "MT5 terminé avec code: $($proc.ExitCode)"
-            if ($proc.ExitCode -eq 0) {
-              Write-Host "MT5 Exness installé [OK]"
-            } else {
-              Write-Host "MT5 install code: $($proc.ExitCode) (peut être OK quand même)"
-            }
-          } catch {
-            Write-Host "MT5 install error: $($_.Exception.Message)"
-          }
-
-          # Vérifier si MT5 est installé
-          $mt5Paths = @(
-            "${Env:PROGRAMFILES}\MetaTrader 5\terminal64.exe",
-            "${Env:PROGRAMFILES(x86)}\MetaTrader 5\terminal64.exe",
-            "$env:APPDATA\MetaQuotes\Terminal\*"
-          )
-          $found = $false
-          foreach ($p in $mt5Paths) {
-            if (Test-Path $p) {
-              Write-Host "MT5 trouvé: $p [OK]"
-              $found = $true
-              break
-            }
-          }
-          if (-not $found) {
-            Write-Host "MT5 non trouvé — recherche élargie..."
-            Get-ChildItem -Path "C:\" -Filter "terminal64.exe" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 3 | ForEach-Object {
-              Write-Host "  Trouvé: $($_.FullName)"
-              $found = $true
-            }
-          }
-          if (-not $found) {
-            Write-Host "MT5 intraptable — copie du setup sur le Bureau"
-            $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
-            if (Test-Path $mt5Exe) {
-              Copy-Item $mt5Exe "$desktop\exness5setup.exe" -Force
-              Write-Host "Setup copié sur le Bureau pour install manuelle"
-            }
-          }
+          $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+          $dest = "$desktop\exness5setup.exe"
+          Write-Host "Téléchargement MT5 Exness sur le Bureau..."
+          Invoke-WebRequest -Uri $mt5Url -OutFile $dest -TimeoutSec 120 -ErrorAction Stop
+          $size = [math]::Round((Get-Item $dest).Length / 1MB, 1)
+          Write-Host "MT5 téléchargé: $dest ($size MB) [OK]"
 
       # ── Setup TradingBot V4 ──
       - name: Setup TradingBot V4
@@ -626,10 +565,39 @@ jobs:
           # Test import rapide
           python -c "import sys; sys.path.insert(0, '$botDir'); from signal_parser import SignalParser; print('Import signal_parser OK')"
 
-      # ── Start Bot ──
+      # ── Start Bot (seulement si MT5 est installé) ──
       - name: Start TradingBot V4
         run: |
           $botDir = "C:\TradingBot"
+
+          # Vérifier si MT5 est installé
+          $mt5Exe = $null
+          $searchPaths = @(
+            "${Env:PROGRAMFILES}\MetaTrader 5\terminal64.exe",
+            "${Env:PROGRAMFILES(x86)}\MetaTrader 5\terminal64.exe"
+          )
+          foreach ($p in $searchPaths) {
+            if (Test-Path $p) { $mt5Exe = $p; break }
+          }
+          if (-not $mt5Exe) {
+            $found = Get-ChildItem -Path "C:\" -Filter "terminal64.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $mt5Exe = $found.FullName }
+          }
+
+          if (-not $mt5Exe) {
+            Write-Host "========================================"
+            Write-Host " MT5 NON INSTALLÉ"
+            Write-Host "========================================"
+            Write-Host "Le setup MT5 est sur le Bureau."
+            Write-Host "1. Connectez-vous en RDP"
+            Write-Host "2. Double-cliquez 'exness5setup.exe'"
+            Write-Host "3. Installez MT5"
+            Write-Host "4. Double-cliquez 'Lancer Bot Trading V4'"
+            Write-Host "========================================"
+            exit 0
+          }
+
+          Write-Host "MT5 trouvé: $mt5Exe"
           Write-Host "Demarrage du bot en arriere-plan..."
           Start-Process -FilePath "python" -ArgumentList "telegram_listener_v4.py" -WorkingDirectory $botDir -RedirectStandardOutput "$botDir\bot_stdout.log" -RedirectStandardError "$botDir\bot_stderr.log" -NoNewWindow
           Start-Sleep -Seconds 5
