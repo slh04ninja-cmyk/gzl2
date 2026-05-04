@@ -88,7 +88,7 @@ SHUTDOWN_MARGIN_MIN = 5
 
 START_TIME = datetime.now(timezone.utc)
 _shutdown_event = asyncio.Event()
-_report_sent = False
+_report_event = asyncio.Event()
 
 
 def _parse_blocked_windows(raw: str) -> list:
@@ -1022,9 +1022,10 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
 # =============================================================
 class TradeManager:
 
-    def __init__(self, bridge: MT5Bridge, reporter: TradeReporter):
+    def __init__(self, bridge: MT5Bridge, reporter: TradeReporter, tracker=None):
         self.bridge = bridge
         self.reporter = reporter
+        self.tracker = tracker
         self.active = []
         self._lock = threading.Lock()  # FIX: thread-safe (to_thread) au lieu de asyncio.Lock
         self._stop = False
@@ -1065,11 +1066,15 @@ class TradeManager:
         # v4.2: Pas de group=symbol (pattern regex dangereux)
         deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
         if deals:
+            # Essai 1: match exact par ticket + symbole
             for deal in reversed(deals):
-                # Filtre exact par symbole + position_id ou order
                 if deal.symbol == symbol and (deal.position_id == ticket or deal.order == ticket):
                     if deal.entry == mt5.DEAL_ENTRY_OUT:
                         return deal.profit
+            # Essai 2: match par position_id seul (suffixe symbole différent)
+            for deal in reversed(deals):
+                if deal.position_id == ticket and deal.entry == mt5.DEAL_ENTRY_OUT:
+                    return deal.profit
         return 0.0
 
     def _get_pos(self, ticket: int):
@@ -1593,7 +1598,6 @@ class TradeReporter:
 # =============================================================
 async def shutdown_watcher(reporter, tracker, bridge, manager, news_mgr):
     """Surveille le temps restant et envoie le rapport avant fermeture."""
-    global _report_sent
 
     if RUNTIME_MINUTES <= 0:
         log.info("[SHUTDOWN] Pas de durée définie → pas de timer")
@@ -1609,8 +1613,8 @@ async def shutdown_watcher(reporter, tracker, bridge, manager, news_mgr):
         now = datetime.now(timezone.utc)
         remaining = (end_time - now).total_seconds() / 60
 
-        if remaining <= SHUTDOWN_MARGIN_MIN and not _report_sent:
-            _report_sent = True
+        if remaining <= SHUTDOWN_MARGIN_MIN and not _report_event.is_set():
+            _report_event.set()
             log.info(
                 f"[SHUTDOWN] Fin dans {remaining:.0f} min → "
                 f"envoi du rapport final"
@@ -1627,11 +1631,10 @@ async def shutdown_watcher(reporter, tracker, bridge, manager, news_mgr):
 
 def sigterm_handler():
     """Appelé quand SIGTERM est reçu (timeout GitHub Actions)."""
-    global _report_sent
     log.info("[SHUTDOWN] SIGTERM reçu → arrêt propre")
     _shutdown_event.set()
-    if not _report_sent:
-        _report_sent = True
+    if not _report_event.is_set():
+        _report_event.set()
         log.info("[SHUTDOWN] Envoi forcé du rapport...")
 
 
@@ -1639,8 +1642,6 @@ def sigterm_handler():
 # MAIN
 # =============================================================
 async def main():
-    global _report_sent
-
     parser = SignalParser()
     bridge = MT5Bridge()
     reporter = TradeReporter()
@@ -1652,8 +1653,7 @@ async def main():
         return
 
     # v4.2: TradeManager async
-    manager = TradeManager(bridge, reporter)
-    manager.tracker = tracker
+    manager = TradeManager(bridge, reporter, tracker)
     await manager.start()
 
     news_mgr = NewsManager(bridge)
@@ -1778,8 +1778,8 @@ async def main():
         )
         await client.run_until_disconnected()
     finally:
-        if not _report_sent and reporter._tg_client:
-            _report_sent = True
+        if not _report_event.is_set() and reporter._tg_client:
+            _report_event.set()
             log.info("[SHUTDOWN] Envoi du rapport final (finally)...")
             try:
                 await tracker.send_final_report(reporter)

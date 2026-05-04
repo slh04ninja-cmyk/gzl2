@@ -133,9 +133,9 @@ def _extract_tps(text: str) -> list[float]:
     if tps:
         return tps
 
-    # Pattern 3: TP 4633, TP 4636 (lignes seules — TP suivi d'un nombre)
+    # Pattern 3: TP 4633, TP 4636 (lignes seules — TP suivi d'un nombre, avec optionnel emoji/texte)
     for m in re.finditer(
-        r"^\s*TP\s+" + RE_NUM + r"\s*$",
+        r"^\s*TP\s+" + RE_NUM + r"(?:\s*[✅☑️✔️🎯]|\s+CONFIRM|\s+HIT)?\s*$",
         text, re.IGNORECASE | re.MULTILINE
     ):
         tps.append(float(m.group(1)))

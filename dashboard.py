@@ -170,7 +170,8 @@ open_trades = trades[trades["result"] == "OPEN"] if not trades.empty else pd.Dat
 if not open_trades.empty:
     for _, t in open_trades.iterrows():
         emoji = "🟢" if t["action"] == "BUY" else "🔴"
-        tps_str = ", ".join([f"TP{i+1}={v}" for i, v in enumerate(t.get("tps", []))])
+        tps_raw = t["tps"] if "tps" in t.index and isinstance(t["tps"], list) else []
+        tps_str = ", ".join([f"TP{i+1}={v}" for i, v in enumerate(tps_raw)])
         with st.container():
             cols = st.columns([2, 1, 1, 1, 1])
             cols[0].markdown(f"{emoji} **{t['symbol']}** {t['action']}")
@@ -185,28 +186,24 @@ else:
 st.markdown("---")
 st.subheader("📊 Performance par canal")
 
-try:
-    canal_result = supabase.table("canal_stats").select("*").execute()
-    canal_df = pd.DataFrame(canal_result.data) if canal_result.data else pd.DataFrame()
-except Exception:
-    canal_df = pd.DataFrame()
-    if not trades.empty:
-        closed = trades[trades["result"].isin(["WIN", "LOSS", "BE"])]
-        if not closed.empty:
-            for canal in closed["canal"].unique():
-                ct = closed[closed["canal"] == canal]
-                w = len(ct[ct["result"] == "WIN"])
-                l = len(ct[ct["result"] == "LOSS"])
-                t = len(ct)
-                pnl = ct["pnl"].sum()
-                canal_df = pd.concat([canal_df, pd.DataFrame([{
-                    "canal": canal,
-                    "total_trades": t,
-                    "wins": w,
-                    "losses": l,
-                    "total_pnl": round(pnl, 2),
-                    "win_rate": round(w/t*100, 1) if t > 0 else 0,
-                }])])
+canal_df = pd.DataFrame()
+if not trades.empty:
+    closed = trades[trades["result"].isin(["WIN", "LOSS", "BE"])]
+    if not closed.empty:
+        for canal in closed["canal"].unique():
+            ct = closed[closed["canal"] == canal]
+            w = len(ct[ct["result"] == "WIN"])
+            l = len(ct[ct["result"] == "LOSS"])
+            t = len(ct)
+            pnl = ct["pnl"].sum()
+            canal_df = pd.concat([canal_df, pd.DataFrame([{
+                "canal": canal,
+                "total_trades": t,
+                "wins": w,
+                "losses": l,
+                "total_pnl": round(pnl, 2),
+                "win_rate": round(w/t*100, 1) if t > 0 else 0,
+            }])])
 
 if not canal_df.empty:
     canal_df = canal_df.sort_values("total_pnl", ascending=False)
