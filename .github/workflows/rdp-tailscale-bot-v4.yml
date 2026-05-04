@@ -576,6 +576,25 @@ jobs:
           # Test import rapide
           python -c "import sys; sys.path.insert(0, '$botDir'); from signal_parser import SignalParser; print('Import signal_parser OK')"
 
+      # ── Start Bot ──
+      - name: Start TradingBot V4
+        run: |
+          $botDir = "C:\TradingBot"
+          Write-Host "Demarrage du bot en arriere-plan..."
+          Start-Process -FilePath "python" -ArgumentList "telegram_listener_v4.py" -WorkingDirectory $botDir -RedirectStandardOutput "$botDir\bot_stdout.log" -RedirectStandardError "$botDir\bot_stderr.log" -NoNewWindow
+          Start-Sleep -Seconds 5
+          if (Test-Path "$botDir\bot_stdout.log") {
+            $size = (Get-Item "$botDir\bot_stdout.log").Length
+            Write-Host "Bot demarre [OK] — log: $size bytes"
+          }
+          if (Test-Path "$botDir\bot_stderr.log") {
+            $errSize = (Get-Item "$botDir\bot_stderr.log").Length
+            if ($errSize -gt 0) {
+              Write-Host "ATTENTION — stderr ($errSize bytes):"
+              Get-Content "$botDir\bot_stderr.log" -Tail 20
+            }
+          }
+
       # ── Keep Alive ──
       - name: Keep alive
         run: |
