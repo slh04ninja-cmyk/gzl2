@@ -519,7 +519,7 @@ jobs:
           $wsh = New-Object -ComObject WScript.Shell
           $lnk = $wsh.CreateShortcut("$desktop\Lancer Bot Trading V4.lnk")
           $lnk.TargetPath = "powershell.exe"
-          $lnk.Arguments = "-NoExit -Command `"cd C:\TradingBot; python telegram_listener_v4.py`""
+          $lnk.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"cd C:\TradingBot; python telegram_listener_v4.py`""
           $lnk.WorkingDirectory = $botDir
           $lnk.IconLocation = "powershell.exe"
           $lnk.Save()
