@@ -103,14 +103,6 @@ on:
         description: "Minutes news séparées par virgules: avant_bloc,avant_fermeture,après (ex: 15,5,15)"
         required: false
         default: "15,5,15"
-      time_filter_enabled:
-        description: "Filtre Horaire (true/false)"
-        required: false
-        default: "true"
-      time_blocked_windows:
-        description: "Fenêtres bloquées UTC (ex: 13:00-15:00,16:30-17:30)"
-        required: false
-        default: "13:00-15:00,16:30-17:30"
 
       # ── Supabase / Dashboard ──
       supabase_url:
@@ -121,6 +113,10 @@ on:
         description: "Supabase Anon Key"
         required: false
         default: ""
+      risk_params:
+        description: "Limites risque: MAX_POSITIONS,MAX_SPREAD_POINTS (ex: 6,50)"
+        required: false
+        default: "6,50"
 
 permissions:
   contents: read
@@ -349,12 +345,31 @@ jobs:
 
       # ── Python Libs ──
       - name: Install Python libs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_REPO: ${{ inputs.bot_repo }}
         run: |
           $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
-          $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
-          $env:Path = "$machinePath;$userPath"
+          $userPath    = [System.Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path    = "$machinePath;$userPath"
           python -m pip install --upgrade pip -q
-          python -m pip install telethon MetaTrader5 python-dotenv supabase -q
+
+          # Essayer de télécharger requirements.txt depuis le repo (API Contents)
+          $repo     = $env:BOT_REPO
+          $headers  = @{ 
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github.v3.raw"
+          }
+          $apiBase   = "https://api.github.com/repos/$repo/contents"
+          $reqFile   = "$env:TEMP\requirements.txt"
+          try {
+            Invoke-WebRequest -Uri "$apiBase/requirements.txt" -OutFile $reqFile -Headers $headers -ErrorAction Stop
+            Write-Host "requirements.txt téléchargé — installation..."
+            python -m pip install -r $reqFile -q
+          } catch {
+            Write-Host "requirements.txt non trouvé — installation des libs de base..."
+            python -m pip install telethon MetaTrader5 python-dotenv supabase streamlit-autorefresh -q
+          }
           python -c "import telethon, MetaTrader5, dotenv, supabase; print('Python libs OK')"
 
       # ── RustDesk ──
@@ -405,10 +420,9 @@ jobs:
           DEMO_MODE: ${{ inputs.demo_mode }}
           NEWS_FILTER_ENABLED: ${{ inputs.news_filter_enabled }}
           NEWS_WINDOWS: ${{ inputs.news_windows }}
-          TIME_FILTER_ENABLED: ${{ inputs.time_filter_enabled }}
-          TIME_BLOCKED_WINDOWS: ${{ inputs.time_blocked_windows }}
           SUPABASE_URL: ${{ inputs.supabase_url }}
           SUPABASE_ANON_KEY: ${{ inputs.supabase_anon_key }}
+          RISK_PARAMS: ${{ inputs.risk_params }}
         run: |
           # ── Créer le dossier ──
           $botDir = "C:\TradingBot"
@@ -416,20 +430,27 @@ jobs:
             New-Item -ItemType Directory -Path $botDir | Out-Null
           }
 
-          # ── Télécharger le bot V4 depuis GitHub ──
-          $base = "https://raw.githubusercontent.com/$env:BOT_REPO/main"
-          $headers = @{ Authorization = "Bearer $env:GH_TOKEN" }
+          # ── Télécharger le bot V4 depuis GitHub (API Contents pour repos privés) ──
+          $repo = $env:BOT_REPO
+          $headers = @{ 
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github.v3.raw"
+          }
+          $apiBase = "https://api.github.com/repos/$repo/contents"
+
           try {
-            Invoke-WebRequest -Uri "$base/telegram_listener_v4.py" -OutFile "$botDir\telegram_listener_v4.py" -Headers $headers -ErrorAction Stop
-            Write-Host "telegram_listener_v4.py téléchargé"
+            $url = "$apiBase/telegram_listener_v4.py"
+            Invoke-WebRequest -Uri $url -OutFile "$botDir\telegram_listener_v4.py" -Headers $headers -ErrorAction Stop
+            Write-Host "telegram_listener_v4.py téléchargé (API GitHub)"
           } catch {
             Write-Warning "Impossible de télécharger telegram_listener_v4.py : $($_.Exception.Message)"
           }
 
           # ── Télécharger supabase_logger.py ──
           try {
-            Invoke-WebRequest -Uri "$base/supabase_logger.py" -OutFile "$botDir\supabase_logger.py" -Headers $headers -ErrorAction Stop
-            Write-Host "supabase_logger.py téléchargé"
+            $url = "$apiBase/supabase_logger.py"
+            Invoke-WebRequest -Uri $url -OutFile "$botDir\supabase_logger.py" -Headers $headers -ErrorAction Stop
+            Write-Host "supabase_logger.py téléchargé (API GitHub)"
           } catch {
             Write-Warning "Impossible de télécharger supabase_logger.py : $($_.Exception.Message)"
           }
@@ -449,6 +470,11 @@ jobs:
           $nwBeforeBlock  = if ($nw.Count -ge 1) { $nw[0] } else { "15" }
           $nwBeforeClose  = if ($nw.Count -ge 2) { $nw[1] } else { "5" }
           $nwAfter        = if ($nw.Count -ge 3) { $nw[2] } else { "15" }
+
+          # ── Parser les risk_params (format: MAX_POSITIONS,MAX_SPREAD_POINTS) ──
+          $rp = $env:RISK_PARAMS -split ',' | ForEach-Object { $_.Trim() }
+          $maxPositions   = if ($rp.Count -ge 1 -and $rp[0] -match '^\d+$') { $rp[0] } else { "6" }
+          $maxSpread      = if ($rp.Count -ge 2 -and $rp[1] -match '^\d+$') { $rp[1] } else { "50" }
 
           $lines = @(
             "TG_API_ID=$env:TG_API_ID",
@@ -471,11 +497,13 @@ jobs:
             "NEWS_WINDOW_BEFORE_BLOCK=$nwBeforeBlock",
             "NEWS_WINDOW_BEFORE_CLOSE=$nwBeforeClose",
             "NEWS_WINDOW_AFTER=$nwAfter",
-            "TIME_FILTER_ENABLED=$env:TIME_FILTER_ENABLED",
-            "TIME_BLOCKED_WINDOWS=$env:TIME_BLOCKED_WINDOWS",
+            "TIME_FILTER_ENABLED=false",
+            "TIME_BLOCKED_WINDOWS=",
             "RUNTIME_MINUTES=$env:RUNTIME_MINUTES",
             "SUPABASE_URL=$env:SUPABASE_URL",
-            "SUPABASE_ANON_KEY=$env:SUPABASE_ANON_KEY"
+            "SUPABASE_ANON_KEY=$env:SUPABASE_ANON_KEY",
+            "MAX_POSITIONS=$maxPositions",
+            "MAX_SPREAD_POINTS=$maxSpread"
           )
           $lines | Set-Content -Path $envFile -Encoding UTF8
           Write-Host "Fichier .env créé"
@@ -518,6 +546,15 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
+# ── Cleanup sécurité: supprimer le fichier .env ──
+      - name: Cleanup .env
+        if: always()
+        run: |
+          $envFile = "C:\TradingBot\.env"
+          if (Test-Path $envFile) {
+            Remove-Item $envFile -Force
+            Write-Host "Fichier .env supprimé (cleanup sécurité)"
+          }
       # ── Dispatch next or stop ──
       - name: Dispatch next or stop
         if: always()
@@ -565,10 +602,9 @@ jobs:
                 demo_mode = "${{ inputs.demo_mode }}"
                 news_filter_enabled = "${{ inputs.news_filter_enabled }}"
                 news_windows = "${{ inputs.news_windows }}"
-                time_filter_enabled = "${{ inputs.time_filter_enabled }}"
-                time_blocked_windows = "${{ inputs.time_blocked_windows }}"
                 supabase_url = "${{ inputs.supabase_url }}"
                 supabase_anon_key = "${{ inputs.supabase_anon_key }}"
+                risk_params = "${{ inputs.risk_params }}"
               }
               $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-rustdesk-B.yml/dispatches"
               $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }

@@ -1,14 +1,17 @@
 """
 =============================================================
  TELEGRAM → MT5 | Bot Trading
- Version 4.0 — Corrigé, Restructuré + Performance Tracker
+ Version 4.3 — CAS 1 fix + CAS 2: 2 limits TP=TP_final, code gère fermeture/BE/trailing à TP2
 =============================================================
- Nouveautés v3.1 :
- - PerformanceTracker : log CSV + stats par canal
- - Rapport final + CSV envoyés sur Telegram avant fermeture
- - Timer de fermeture : rapport envoyé 5 min avant la fin
- - SIGTERM handler : arrêt propre si timeout GitHub
- - Shutdown automatique avec envoi de rapport
+ Changements v4.1 :
+ - FIX: _parse_main() group(4) optionnel (évite TypeError)
+ - FIX: datetime naive vs aware (duree_min maintenant correct)
+ - FIX: threading.Lock au lieu de asyncio.Lock (thread-safe)
+ - FIX: is_spam() appelé AVANT les parsers spécialisés
+ - NEW: Parser V5 — reconstruit de zéro (6 formats supportés)
+ - NEW: CAS 1 → 1 market (TP2) + 1 limit (TP_final)
+ - NEW: CAS 1 TP2 hit → annule limit ou active BE+trailing
+ - DEL: Filtre horaire désactivé temporairement
 """
 
 import asyncio
@@ -17,18 +20,16 @@ import logging
 import time
 import json
 import urllib.request
-import csv
 import signal
 import os
+import threading  # FIX: thread-safe lock pour to_thread
 from datetime import datetime, timedelta, timezone
-from collections import defaultdict
 from dotenv import load_dotenv
-import threading
 
 from telethon import TelegramClient, events
 import MetaTrader5 as mt5
 
-# Constantes de filling mode (pas toujours présentes dans toutes les versions du package MT5)
+# Constantes de filling mode
 SYMBOL_FILLING_FOK = 1
 SYMBOL_FILLING_IOC = 2
 ORDER_FILLING_RETURN = 0
@@ -63,6 +64,8 @@ SLIPPAGE = int(os.getenv("SLIPPAGE", "20"))
 ORDER_EXPIRY_MIN = int(os.getenv("ORDER_EXPIRY_MINUTES", "240"))
 TRAIL_POINTS = float(os.getenv("TRAIL_POINTS", "150"))
 LOT_SIZE = float(os.getenv("LOT_TOTAL", "0.01"))
+MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "6"))
+MAX_SPREAD_POINTS = float(os.getenv("MAX_SPREAD_POINTS", "50"))
 
 DEMO_MODE = os.getenv("DEMO_MODE", "true").lower() == "true"
 
@@ -71,18 +74,19 @@ NEWS_BLOCK_MIN = int(os.getenv("NEWS_WINDOW_BEFORE_BLOCK", "15"))
 NEWS_CLOSE_MIN = int(os.getenv("NEWS_WINDOW_BEFORE_CLOSE", "5"))
 NEWS_AFTER_MIN = int(os.getenv("NEWS_WINDOW_AFTER", "15"))
 
-TIME_FILTER_ENABLED = os.getenv("TIME_FILTER_ENABLED", "true").lower() == "true"
+# ⚠️ FILTRE HORAIRE DÉSACTIVÉ TEMPORAIREMENT (v4.2-patch)
+# TIME_FILTER_ENABLED = os.getenv("TIME_FILTER_ENABLED", "true").lower() == "true"
+TIME_FILTER_ENABLED = False
 
-# Shutdown timer
-RUNTIME_MINUTES = int(os.getenv("RUNTIME_MINUTES", "0"))
-SHUTDOWN_MARGIN_MIN = 5  # envoyer le rapport 5 min avant la fin
-
-# TP: Open config — Risk/Reward TP generation
+# TP: Open config
 OPEN_TP_RR_RATIOS = [float(x) for x in os.getenv("OPEN_TP_RR_RATIOS", "1.0,2.0,3.0").split(",")]
 OPEN_TP_COUNT = int(os.getenv("OPEN_TP_COUNT", "3"))
-OPEN_TRAIL_AFTER_TP = int(os.getenv("OPEN_TRAIL_AFTER_TP", "1"))  # trail after TP number N
+OPEN_TRAIL_AFTER_TP = int(os.getenv("OPEN_TRAIL_AFTER_TP", "1"))
 
-START_TIME = datetime.now()
+RUNTIME_MINUTES = int(os.getenv("RUNTIME_MINUTES", "0"))
+SHUTDOWN_MARGIN_MIN = 5
+
+START_TIME = datetime.now(timezone.utc)
 _shutdown_event = asyncio.Event()
 _report_sent = False
 
@@ -104,7 +108,9 @@ def _parse_blocked_windows(raw: str) -> list:
 
 
 _raw_windows = os.getenv("TIME_BLOCKED_WINDOWS", "13:00-15:00,16:30-17:30")
-BLOCKED_WINDOWS = _parse_blocked_windows(_raw_windows)
+# ⚠️ FILTRE HORAIRE DÉSACTIVÉ TEMPORAIREMENT (v4.2-patch)
+# BLOCKED_WINDOWS = _parse_blocked_windows(_raw_windows)
+BLOCKED_WINDOWS = []
 
 # ------------------------------------------------------------------
 # LOGGING
@@ -139,7 +145,7 @@ try:
 except ImportError:
     _supa = None
     _supa_connected = False
-    log.warning("supabase_logger non trouvé — mode CSV seul")
+    log.warning("supabase_logger non trouvé — pas de log distant")
 
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(
@@ -149,43 +155,25 @@ console_handler.addFilter(OrderFilter())
 log.addHandler(console_handler)
 
 # ------------------------------------------------------------------
-# FILTRE MESSAGES NON-TRADING
+# FILTRE MESSAGES NON-TRADING (importé depuis signal_parser.py)
 # ------------------------------------------------------------------
-EXCLUDE_KEYWORDS = [
-    "tp hit", "tp1 hit", "tp2 hit", "tp3 hit", "tp reached",
-    "all tp hit", "mission acomplished", "boom boom boom",
-    "my signal are on fire", "pips profit", "pips gain",
-    "target", "closed at", "exit at", "sl hit", "stopped",
-    "secured", "hit target", "be safe", "good luck",
-    "market update", "analysis", "running",
-    "are you in big loss", "contact",
-    "use proper money management",
-    "consistency",
-]
-
-
-def is_spam(text: str) -> bool:
-    low = text.lower()
-    for kw in EXCLUDE_KEYWORDS:
-        if kw in low:
-            return True
-    return False
-
+# is_spam est importé depuis signal_parser.py via `from signal_parser import SignalParser, is_spam`
 
 # ------------------------------------------------------------------
 # GESTION FENÊTRES HORAIRES BLOQUÉES
 # ------------------------------------------------------------------
 def in_blocked_window() -> tuple[bool, str]:
-    if not TIME_FILTER_ENABLED:
-        return False, ""
-    now = datetime.now(timezone.utc)
-    now_minutes = now.hour * 60 + now.minute
-    for (h1, m1, h2, m2) in BLOCKED_WINDOWS:
-        start = h1 * 60 + m1
-        end = h2 * 60 + m2
-        if start <= now_minutes < end:
-            desc = f"{h1:02d}h{m1:02d}-{h2:02d}h{m2:02d} UTC"
-            return True, desc
+    # ⚠️ FILTRE HORAIRE DÉSACTIVÉ TEMPORAIREMENT (v4.2-patch)
+    # if not TIME_FILTER_ENABLED:
+    #     return False, ""
+    # now = datetime.now(timezone.utc)
+    # now_minutes = now.hour * 60 + now.minute
+    # for (h1, m1, h2, m2) in BLOCKED_WINDOWS:
+    #     start = h1 * 60 + m1
+    #     end = h2 * 60 + m2
+    #     if start <= now_minutes < end:
+    #         desc = f"{h1:02d}h{m1:02d}-{h2:02d}h{m2:02d} UTC"
+    #         return True, desc
     return False, ""
 
 
@@ -194,39 +182,17 @@ def in_blocked_window() -> tuple[bool, str]:
 # =============================================================
 class PerformanceTracker:
 
-    CSV_FILE = "trades_log.csv"
-    CSV_HEADERS = [
-        "date", "time", "canal", "symbol", "action",
-        "zone_low", "zone_high", "sl", "tp_count",
-        "tp_final", "result", "pnl", "duree_min"
-    ]
-
     def __init__(self):
-        self._ensure_csv()
         self._trades_cache = []
         self._report_sent = False
 
-    def _ensure_csv(self):
-        if not os.path.exists(self.CSV_FILE):
-            with open(self.CSV_FILE, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(self.CSV_HEADERS)
-            log.info(f"[PERF] CSV créé : {self.CSV_FILE}")
-
     def log_trade_open(self, entry):
         sig = entry["signal"]
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         row = {
-            "date": now.strftime("%Y-%m-%d"),
-            "time": now.strftime("%H:%M:%S"),
             "canal": sig.get("source_channel", "Inconnu"),
             "symbol": sig["symbol"],
             "action": sig["action"],
-            "zone_low": sig["zone_low"],
-            "zone_high": sig["zone_high"],
-            "sl": sig["sl"],
-            "tp_count": len(sig["tps"]),
-            "tp_final": sig["tps"][-1],
             "result": "OPEN",
             "pnl": 0.0,
             "duree_min": 0,
@@ -238,7 +204,7 @@ class PerformanceTracker:
     def log_trade_close(self, entry, total_pnl):
         sig = entry["signal"]
         canal = sig.get("source_channel", "Inconnu")
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         result = "WIN" if total_pnl > 0 else ("BE" if total_pnl == 0 else "LOSS")
 
         for t in reversed(self._trades_cache):
@@ -251,150 +217,7 @@ class PerformanceTracker:
                 t["result"] = result
                 t["pnl"] = round(total_pnl, 2)
                 t["duree_min"] = round(duree, 1)
-                self._append_csv(t)
                 break
-        else:
-            row = {
-                "date": now.strftime("%Y-%m-%d"),
-                "time": now.strftime("%H:%M:%S"),
-                "canal": canal,
-                "symbol": sig["symbol"],
-                "action": sig["action"],
-                "zone_low": sig["zone_low"],
-                "zone_high": sig["zone_high"],
-                "sl": sig["sl"],
-                "tp_count": len(sig["tps"]),
-                "tp_final": sig["tps"][-1],
-                "result": result,
-                "pnl": round(total_pnl, 2),
-                "duree_min": 0,
-            }
-            self._append_csv(row)
-
-    def _append_csv(self, row):
-        with open(self.CSV_FILE, "a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                row["date"], row["time"], row["canal"],
-                row["symbol"], row["action"],
-                row["zone_low"], row["zone_high"], row["sl"],
-                row["tp_count"], row["tp_final"],
-                row["result"], row["pnl"], row["duree_min"],
-            ])
-
-    def get_stats_by_channel(self) -> dict:
-        if not os.path.exists(self.CSV_FILE):
-            return {}
-
-        trades = []
-        with open(self.CSV_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row["result"] in ("OPEN", ""):
-                    continue
-                trades.append(row)
-
-        stats = defaultdict(lambda: {
-            "trades": 0, "wins": 0, "losses": 0, "be": 0,
-            "pnl_total": 0.0, "pnl_wins": 0.0, "pnl_losses": 0.0,
-            "best": 0.0, "worst": 0.0,
-        })
-
-        for t in trades:
-            canal = t["canal"]
-            pnl = float(t["pnl"])
-            s = stats[canal]
-            s["trades"] += 1
-            s["pnl_total"] += pnl
-            if pnl > 0:
-                s["wins"] += 1
-                s["pnl_wins"] += pnl
-                s["best"] = max(s["best"], pnl)
-            elif pnl < 0:
-                s["losses"] += 1
-                s["pnl_losses"] += abs(pnl)
-                s["worst"] = min(s["worst"], pnl)
-            else:
-                s["be"] += 1
-
-        for canal, s in stats.items():
-            if s["trades"] > 0:
-                s["win_rate"] = round(s["wins"] / s["trades"] * 100, 1)
-            else:
-                s["win_rate"] = 0
-            if s["pnl_losses"] > 0:
-                s["profit_factor"] = round(s["pnl_wins"] / s["pnl_losses"], 2)
-            else:
-                s["profit_factor"] = (
-                    float("inf") if s["pnl_wins"] > 0 else 0
-                )
-            s["pnl_total"] = round(s["pnl_total"], 2)
-            s["avg_win"] = (
-                round(s["pnl_wins"] / s["wins"], 2) if s["wins"] > 0 else 0
-            )
-            s["avg_loss"] = (
-                round(s["pnl_losses"] / s["losses"], 2)
-                if s["losses"] > 0 else 0
-            )
-            if s["avg_loss"] > 0:
-                s["rr_ratio"] = round(s["avg_win"] / s["avg_loss"], 2)
-            else:
-                s["rr_ratio"] = 0
-
-        return dict(stats)
-
-    def format_report(self) -> str:
-        stats = self.get_stats_by_channel()
-        if not stats:
-            return "📊 Aucun trade enregistré pour le moment."
-
-        sorted_channels = sorted(
-            stats.items(),
-            key=lambda x: x[1]["pnl_total"],
-            reverse=True,
-        )
-
-        total_trades = sum(s["trades"] for _, s in sorted_channels)
-        total_pnl = sum(s["pnl_total"] for _, s in sorted_channels)
-
-        lines = [
-            "📊 RAPPORT DE PERFORMANCE",
-            "━━━━━━━━━━━━━━━━━━━━━━━━━━━━",
-            f"📅 {datetime.now():%Y-%m-%d %H:%M}",
-            f"📈 Total : {total_trades} trades | {total_pnl:+.2f}$",
-            "",
-        ]
-
-        medals = ["🥇", "🥈", "🥉", "4️⃣"]
-        for i, (canal, s) in enumerate(sorted_channels):
-            medal = medals[i] if i < len(medals) else f"{i + 1}."
-            emoji = "✅" if s["pnl_total"] > 0 else "❌"
-            lines.append(f"{medal} {canal} {emoji}")
-            lines.append(
-                f"   Trades: {s['trades']} | "
-                f"Win: {s['win_rate']}% | "
-                f"P&L: {s['pnl_total']:+.2f}$"
-            )
-            lines.append(
-                f"   PF: {s['profit_factor']} | "
-                f"R:R: {s['rr_ratio']} | "
-                f"Best: {s['best']:+.2f}$"
-            )
-            lines.append("")
-
-        lines.append("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        best = sorted_channels[0]
-        worst = sorted_channels[-1]
-        if best[1]["pnl_total"] > 0:
-            lines.append(
-                f"🏆 Meilleur canal : {best[0]} ({best[1]['pnl_total']:+.2f}$)"
-            )
-        if worst[1]["pnl_total"] < 0:
-            lines.append(
-                f"⚠️ Pire canal : {worst[0]} ({worst[1]['pnl_total']:+.2f}$)"
-            )
-
-        return "\n".join(lines)
 
     def format_session_summary(self) -> str:
         if not self._trades_cache:
@@ -403,9 +226,7 @@ class PerformanceTracker:
         wins = sum(1 for t in self._trades_cache if t["result"] == "WIN")
         losses = sum(1 for t in self._trades_cache if t["result"] == "LOSS")
         be = sum(1 for t in self._trades_cache if t["result"] == "BE")
-        still_open = sum(
-            1 for t in self._trades_cache if t["result"] == "OPEN"
-        )
+        still_open = sum(1 for t in self._trades_cache if t["result"] == "OPEN")
         total_pnl = sum(t["pnl"] for t in self._trades_cache)
 
         lines = [
@@ -419,41 +240,13 @@ class PerformanceTracker:
         ]
         return "\n".join(lines)
 
-    async def send_csv_to_telegram(self, reporter):
-        if not os.path.exists(self.CSV_FILE):
-            return
-        try:
-            await reporter.send_tg(
-                "📄 Voici le fichier de trades de cette session :"
-            )
-            if reporter._tg_client and reporter._report_entity:
-                await reporter._tg_client.send_file(
-                    reporter._report_entity,
-                    self.CSV_FILE,
-                    caption=(
-                        f"📊 trades_log.csv — {datetime.now():%Y-%m-%d %H:%M}"
-                    ),
-                )
-                log.info("[PERF] CSV envoyé sur Telegram")
-        except Exception as e:
-            log.error(f"[PERF] Erreur envoi CSV : {e}")
-
     async def send_final_report(self, reporter):
         if self._report_sent:
             return
         self._report_sent = True
         log.info("[PERF] Envoi du rapport final...")
-
-        # 1. Résumé session
         summary = self.format_session_summary()
         await reporter.send_tg(summary)
-
-        # 2. Rapport complet par canal
-        report = self.format_report()
-        await reporter.send_tg(report)
-
-        # 3. Envoyer le CSV
-        await self.send_csv_to_telegram(reporter)
 
 
 # =============================================================
@@ -469,8 +262,8 @@ class NewsManager:
         self._news = []
         self._blocked = False
         self._stop = False
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        # v4.2: Utilise asyncio au lieu de threading
+        self._task = None
 
     def set_manager(self, manager):
         self.manager = manager
@@ -478,17 +271,18 @@ class NewsManager:
     def is_blocked(self) -> bool:
         return self._blocked
 
-    def _loop(self):
+    async def start(self):
+        """Démarre la boucle de news en tant que tâche asyncio."""
+        self._task = asyncio.create_task(self._loop_async())
+
+    async def _loop_async(self):
         while not self._stop:
             try:
-                self._fetch_news()
-                self._check_news()
+                await asyncio.to_thread(self._fetch_news)
+                await asyncio.to_thread(self._check_news)
             except Exception as e:
                 log.error(f"NewsManager erreur: {e}")
-            for _ in range(30):
-                if self._stop:
-                    break
-                time.sleep(60)
+            await asyncio.sleep(1800)  # 30 minutes
 
     def _fetch_news(self):
         try:
@@ -523,9 +317,7 @@ class NewsManager:
                 remaining = NEWS_AFTER_MIN + diff_minutes
                 if remaining <= 0:
                     self._blocked = False
-                    log.info(
-                        f"[NEWS] {news.get('title', '?')} terminé → reprise"
-                    )
+                    log.info(f"[NEWS] {news.get('title', '?')} terminé → reprise")
                     break
 
             if 0 < diff_minutes <= NEWS_CLOSE_MIN:
@@ -550,675 +342,26 @@ class NewsManager:
 
     def _close_all(self):
         if self.manager:
-            with self.manager._lock:
-                for entry in list(self.manager.active):
-                    for o in entry.get("orders", []):
-                        self.bridge.cancel_order(o["order"])
-                    entry["orders"] = []
+            for entry in list(self.manager.active):
+                for o in entry.get("orders", []):
+                    self.bridge.cancel_order(o["order"])
+                entry["orders"] = []
             self.bridge.close_all()
 
     def stop(self):
         self._stop = True
+        if self._task:
+            self._task.cancel()
 
 
 # =============================================================
-# TRADE REPORTER
+# SIGNAL PARSER (V5 — importé depuis signal_parser.py)
 # =============================================================
-class TradeReporter:
-
-    def __init__(self):
-        self._tg_client = None
-        self._report_entity = None
-        self._loop = None
-
-    async def set_telegram_client(self, client: TelegramClient):
-        self._tg_client = client
-        self._loop = asyncio.get_running_loop()
-        if REPORT_CHANNEL:
-            try:
-                self._report_entity = await client.get_entity(REPORT_CHANNEL)
-                log.info(
-                    f"Canal de rapport : "
-                    f"{getattr(self._report_entity, 'title', REPORT_CHANNEL)}"
-                )
-            except Exception as e:
-                log.warning(f"Canal de rapport introuvable : {e}")
-                self._report_entity = None
-
-    async def send_tg(self, message: str):
-        if self._tg_client and self._report_entity:
-            try:
-                await self._tg_client.send_message(
-                    self._report_entity, message
-                )
-            except Exception as e:
-                log.error(f"Erreur envoi rapport TG : {e}")
-
-    async def on_order_opened(self, entry):
-        sig = entry["signal"]
-        canal = sig.get("source_channel", "Inconnu")
-        zone = f"{sig['zone_low']}-{sig['zone_high']}"
-        all_tps = sig["tps"]
-        tps_str = ", ".join([f"TP{i + 1}={v}" for i, v in enumerate(all_tps)])
-
-        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
-        msg = (
-            f"🟢 ORDRE OUVERT {mode_tag}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"📍 Zone : {zone}\n"
-            f"❌ SL : {sig['sl']}\n"
-            f"🎯 {tps_str}\n"
-            f"📦 Lot : {LOT_SIZE} × {len(entry['tickets'])} position(s)\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
-
-    async def on_tp_reached(self, ticket, sig, tp_name, tp_value, pnl):
-        canal = sig.get("source_channel", "Inconnu")
-        msg = (
-            f"🎯 {tp_name} ATTEINT\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"🎯 {tp_name} : {tp_value}\n"
-            f"💰 P&L : {pnl:+.2f} $\n"
-            f"🎫 Ticket : #{ticket}\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
-
-    async def on_sl_hit(self, ticket, sig, pnl):
-        canal = sig.get("source_channel", "Inconnu")
-        zone = f"{sig['zone_low']}-{sig['zone_high']}"
-        msg = (
-            f"🔴 SL TOUCHÉ\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"📍 Zone : {zone}\n"
-            f"❌ SL : {sig['sl']}\n"
-            f"💸 P&L : {pnl:+.2f} $\n"
-            f"🎫 Ticket : #{ticket}\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
-
-    async def on_trade_closed(self, entry, total_pnl):
-        sig = entry["signal"]
-        canal = sig.get("source_channel", "Inconnu")
-        zone = f"{sig['zone_low']}-{sig['zone_high']}"
-        emoji = "✅" if total_pnl >= 0 else "❌"
-        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
-        msg = (
-            f"{emoji} TRADE FERMÉ {mode_tag}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now():%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"📍 Zone : {zone}\n"
-            f"❌ SL : {sig['sl']}\n"
-            f"💰 P&L TOTAL : {total_pnl:+.2f} $\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
+from signal_parser import SignalParser, is_spam
 
 
 # =============================================================
-# SIGNAL PARSER
-# =============================================================
-class SignalParser:
-
-    SYMBOL_MAP = {"GOLD": "XAUUSD", "SILVER": "XAGUSD", "OIL": "USOIL", "BTC": "BTCUSD", "BITCOIN": "BTCUSD"}
-
-    RE_MAIN = re.compile(
-        r"\(?(XAUUSD|GOLD|XAU/USD|XAGUSD|SILVER|USOIL|OIL|BTCUSD|BTC/USD|BTC)\)?\s+"
-        r"(?:INSTANT\s+|NOW[:\s]*)?(?:INSTANT\s+)?(BUY|SELL)"
-        r"[^\d\n]{0,30}?(?:Entry:\s*)?\(?\s*([\d.]+)\s*[-/_\s]\s*([\d.]+)?\s*\)?",
-        re.IGNORECASE,
-    )
-
-    RE_MAIN_REV = re.compile(
-        r"(BUY|SELL)\s+"
-        r"(?:.*?(?:Pair|Symbol)\s*[:.]?\s*)?"
-        r"\(?(XAUUSD|GOLD|XAU/USD|XAGUSD|SILVER|USOIL|OIL|BTCUSD|BTC/USD|BTC)\)?"
-        r"[^\d]{0,80}?(?:Price|Entry)\s*[:.]\s*\(?\s*([\d.]+)\s*[-/_\s]\s*([\d.]+)?\s*\)?",
-        re.IGNORECASE | re.DOTALL,
-    )
-
-    # Type: SELL / Pair: XAUUSD / Entry Price: ... format
-    RE_TYPE_FORMAT = re.compile(
-        r"Type\s*[:.]\s*(BUY|SELL)",
-        re.IGNORECASE,
-    )
-
-    RE_PAIR_FORMAT = re.compile(
-        r"Pair\s*[:.]\s*\(?([\w/]+)\)?",
-        re.IGNORECASE,
-    )
-
-    RE_ENTRY_PRICE = re.compile(
-        r"(?:Entry\s*)?Price\s*[:.]\s*([\d.]+)\s*[-/_\s]\s*([\d.]+)",
-        re.IGNORECASE,
-    )
-
-    RE_MAIN_ALT = re.compile(
-        r"(BUY|SELL)\s+TRADE\s+\(?(XAUUSD|GOLD|XAU/USD|BTCUSD|BTC/USD|BTC)\)?", re.IGNORECASE
-    )
-
-    RE_ZONE_LINE = re.compile(
-        r"^\s*([\d.]+)\s*[-/]\s*([\d.]+)\s*$", re.MULTILINE
-    )
-
-    RE_TARGET_OPEN = re.compile(
-        r"(?:Target|TP)\s*:\s*open", re.IGNORECASE
-    )
-
-    RE_SL_TARGET = re.compile(
-        r"(?:📍\s*)?Stop\s+Loss\s*:\s*([\d.]+)", re.IGNORECASE
-    )
-
-    RE_TP = re.compile(
-        r"(?:\U0001F3AF|\U0001F4CA|\u27A4|\u25BA|\u25B6)?\s*"
-        r"\bTP\d*(?:\s*\(\s*TP\d+\s*\))?"
-        r"[:.]\s*"
-        r"([\d]{3,}(?:\.\d+)?)(?:-max[\d.]+)?",
-        re.IGNORECASE,
-    )
-
-    RE_TP_TAKE = re.compile(
-        r"(?:Take\s+Profit|TAKE\s+PROFIT)\s*\d*\s*(?:\(\s*TP\d+\s*\))?\s*[:.]?\s*([\d.]+)",
-        re.IGNORECASE,
-    )
-
-    RE_TP_LONG = re.compile(
-        r"TAKE\s+PROFIT\s*[:.]\s*(?:\d+\s+)?\(?\s*"
-        r"([\d]{4,}(?:\.\d+)?)\s*\)?(?:\s*CONFIRM\S*)?",
-        re.IGNORECASE,
-    )
-
-    RE_SL = re.compile(
-        r"(?:\U0001F534|\u274C|\U0001F6D1|\u26D4|\U0001F44E)?\s*"
-        r"SL[-.\s]{0,5}([\d]{3,}(?:\.\d+)?)",
-        re.IGNORECASE,
-    )
-
-    RE_SL_LONG = re.compile(
-        r"STOP(?:\s+)?LOSS\s*(?:\(\s*SL\s*\))?\s*[:.]\s*\(?\s*([\d]{3,}(?:\.\d+)?)\s*\)?",
-        re.IGNORECASE,
-    )
-
-    RE_SL_MOVE = re.compile(
-        r"(?:SL\s*MOVE|MOVE\s*SL|New\s*SL|SL\s*\u2192|SL\s*moved?\s*to)"
-        r"\s*[:\s]*\s*([\d.]+)",
-        re.IGNORECASE,
-    )
-
-    RE_SL_ALONE = re.compile(
-        r"^\s*(?:\U0001F534|\u274C|\U0001F6D1)?\s*SL\s*[.:\s]+\s*"
-        r"([\d]{3,}(?:\.\d+)?)\s*$",
-        re.IGNORECASE | re.MULTILINE,
-    )
-
-    # --- Purchase / Sell Order format (✅...❌) ---
-    RE_PURCHASE_ORDER = re.compile(
-        r"(?:✅\s*)?"
-        r"([\w/]+)\s*(?:\([\w/]+\))?\s*"
-        r"(Purchase|Sell)\s+Order",
-        re.IGNORECASE,
-    )
-
-    RE_PURCHASE_ENTRY = re.compile(
-        r"Entry\s+Price\s*([\d.]+)\s*[-/]\s*([\d.]+)",
-        re.IGNORECASE,
-    )
-
-    RE_PURCHASE_TP = re.compile(
-        r"TP[¹²³⁴⁵⁶⁷⁸⁹\d]*\s+([\d.]+)",
-        re.IGNORECASE,
-    )
-
-    RE_PURCHASE_SL = re.compile(
-        r"(?:❌\s*)?Stop\s+Loss\s*:\s*([\d.]+)(?:\s*❌)?",
-        re.IGNORECASE,
-    )
-
-    RE_CLOSE = re.compile(r"close\s+(all|[A-Z]{3,10})", re.IGNORECASE)
-
-    RE_DAILY_ACTION = re.compile(
-        r"(XAUUSD|GOLD|XAU/USD|XAGUSD|SILVER|USOIL|OIL|BTCUSD|BTC/USD|BTC)\s+DAILY\s+SIGNAL",
-        re.IGNORECASE,
-    )
-    RE_DAILY_DIR = re.compile(r"Action\s*:\s*(BUY|SELL)", re.IGNORECASE)
-    RE_DAILY_ENTRY = re.compile(
-        r"Entry\s+Price\s*\n\s*([\d.]+)\s*[-/\s]\s*([\d.]+)", re.IGNORECASE
-    )
-    RE_DAILY_TP = re.compile(r"TP\d+\s*:\s*([\d.]+)", re.IGNORECASE)
-    RE_DAILY_SL = re.compile(
-        r"Stop\s+Loss\s*(?:\(SL\))?\s*:\s*([\d.]+)", re.IGNORECASE
-    )
-
-    RE_TAKE_PROFITE = re.compile(
-        r"TAKE\s+PROFITE?\s*:\s*\d+\s*\(\s*([\d.]+)\s*\)", re.IGNORECASE
-    )
-
-    RE_TP_LINE = re.compile(
-        r"^\s*TP\s+([\d.]+)\s*$", re.IGNORECASE | re.MULTILINE
-    )
-
-    @staticmethod
-    def _detect_action(zone_low, zone_high, tps):
-        """Detect BUY/SELL by comparing entry zone vs TPs average."""
-        avg_entry = (zone_low + zone_high) / 2
-        avg_tp = sum(tps) / len(tps)
-        return "SELL" if avg_tp < avg_entry else "BUY"
-
-    def _build_result(
-        self, symbol, action, zone_low, zone_mid, zone_high, tps, sl
-    ):
-        # Always auto-detect direction from prices
-        action = self._detect_action(zone_low, zone_high, tps)
-        return {
-            "type": "TRADE",
-            "symbol": symbol,
-            "action": action,
-            "zone_low": zone_low,
-            "zone_mid": zone_mid,
-            "zone_high": zone_high,
-            "tps": tps,
-            "tp1": tps[0],
-            "tp2": tps[1] if len(tps) >= 2 else tps[-1],
-            "tp3": tps[2] if len(tps) >= 3 else tps[-1],
-            "tp4": tps[3] if len(tps) >= 4 else tps[-1],
-            "tp_final": tps[-1],
-            "sl": sl,
-        }
-
-    def parse(self, text: str) -> dict | None:
-
-        # Try Type: SELL / Pair: XAUUSD format
-        type_result = self._parse_type_format(text)
-        if type_result:
-            return type_result
-
-        # Try Purchase/Sell Order format (✅...❌)
-        po_result = self._parse_purchase_order(text)
-        if po_result:
-            return po_result
-
-        close_m = self.RE_CLOSE.search(text.upper())
-        if close_m:
-            target = close_m.group(1).upper()
-            return {
-                "type": "CLOSE",
-                "symbol": None if target == "ALL" else target,
-                "close_all": target == "ALL",
-            }
-
-        sl_move_m = self.RE_SL_MOVE.search(text)
-        if sl_move_m:
-            return {
-                "type": "SL_MOVE",
-                "new_sl": float(sl_move_m.group(1)),
-            }
-
-        daily_m = self.RE_DAILY_ACTION.search(text)
-        if daily_m:
-            action_m = self.RE_DAILY_DIR.search(text)
-            entry_m = self.RE_DAILY_ENTRY.search(text)
-            sl_m = self.RE_DAILY_SL.search(text)
-            tp_vals = [float(v) for v in self.RE_DAILY_TP.findall(text)]
-            if action_m and entry_m and tp_vals and sl_m:
-                sym = self.SYMBOL_MAP.get(
-                    daily_m.group(1).upper(), daily_m.group(1).upper()
-                )
-                act = action_m.group(1).upper()
-                try:
-                    pa = float(entry_m.group(1))
-                    pb = float(entry_m.group(2))
-                except ValueError:
-                    return None
-                zl, zh = min(pa, pb), max(pa, pb)
-                zm = round((zl + zh) / 2, 2)
-                sl = float(sl_m.group(1))
-                log.info(
-                    f"DAILY → {act} {sym} zone [{zl}—{zm}—{zh}] "
-                    f"({len(tp_vals)} TPs)"
-                )
-                return self._build_result(sym, act, zl, zm, zh, tp_vals, sl)
-            return None
-
-        tp_profite = self.RE_TAKE_PROFITE.findall(text)
-        if tp_profite:
-            main_m = self.RE_MAIN.search(text)
-            if main_m:
-                sym = self.SYMBOL_MAP.get(
-                    main_m.group(1).upper(), main_m.group(1).upper()
-                )
-                act = main_m.group(2).upper()
-                try:
-                    pa = float(main_m.group(3))
-                    pb = float(main_m.group(4)) if main_m.group(4) else pa
-                except ValueError:
-                    return None
-                zl, zh = min(pa, pb), max(pa, pb)
-                zm = round((zl + zh) / 2, 2)
-                tps = [float(v) for v in tp_profite]
-                sl_m2 = self.RE_SL_LONG.search(text) or self.RE_SL.search(
-                    text
-                )
-                sl = float(sl_m2.group(1)) if sl_m2 else None
-                if not tps or sl is None:
-                    return None
-                log.info(f"TAKE PROFITE → {act} {sym} ({len(tps)} TPs)")
-                return self._build_result(sym, act, zl, zm, zh, tps, sl)
-
-        if is_spam(text):
-            log.debug(f"[SPAM] {text[:60].replace(chr(10), ' ')}")
-            return None
-
-        main_m = self.RE_MAIN.search(text)
-        if not main_m:
-            main_m = self.RE_MAIN_REV.search(text)
-            if main_m:
-                # RE_MAIN_REV: group(1)=action, group(2)=symbol, group(3)=price1, group(4)=price2
-                # Remap to match _parse_main expectations: group(1)=symbol, group(2)=action, group(3)=price1, group(4)=price2
-                class _M:
-                    def __init__(self, m):
-                        self._m = m
-                    def group(self, n):
-                        remap = {1: 2, 2: 1, 3: 3, 4: 4}
-                        return self._m.group(remap[n])
-                main_m = _M(main_m)
-        if not main_m:
-            return self._parse_alt(text)
-        return self._parse_main(main_m, text)
-
-    def _parse_type_format(self, text: str) -> dict | None:
-        """Parse Type: SELL / Pair: XAUUSD / Entry Price: ... format."""
-        type_m = self.RE_TYPE_FORMAT.search(text)
-        pair_m = self.RE_PAIR_FORMAT.search(text)
-        entry_m = self.RE_ENTRY_PRICE.search(text)
-        if not (type_m and pair_m and entry_m):
-            return None
-
-        action = type_m.group(1).upper()
-        raw_sym = pair_m.group(1).upper().replace("/", "")
-        sym = self.SYMBOL_MAP.get(raw_sym, raw_sym)
-
-        try:
-            pa = float(entry_m.group(1))
-            pb = float(entry_m.group(2))
-        except ValueError:
-            return None
-        zl, zh = min(pa, pb), max(pa, pb)
-        zm = round((zl + zh) / 2, 2)
-
-        # TPs: try specific patterns first
-        tps = []
-        for val in self.RE_TP_TAKE.findall(text):
-            try:
-                tps.append(float(val))
-            except ValueError:
-                pass
-        if not tps:
-            for val in self.RE_TP.findall(text):
-                try:
-                    tps.append(float(val))
-                except ValueError:
-                    pass
-        if not tps:
-            for val in self.RE_TP_LONG.findall(text):
-                try:
-                    tps.append(float(val))
-                except ValueError:
-                    pass
-
-        sl_m = self.RE_SL.search(text)
-        if not sl_m:
-            sl_m = self.RE_SL_LONG.search(text)
-        sl = float(sl_m.group(1)) if sl_m else None
-
-        if not tps:
-            tps = self._extract_tps(text, action, zl, zh, sl=sl)
-
-        if not tps or sl is None:
-            log.warning(f"TypeFormat incomplet TPs={tps} SL={sl} | {text[:80]}")
-            return None
-
-        log.info(
-            f"TypeFormat → {action} {sym} zone [{zl}—{zm}—{zh}] "
-            f"TPfinal={tps[-1]} SL={sl} ({len(tps)} TPs)"
-        )
-        return self._build_result(sym, action, zl, zm, zh, tps, sl)
-
-    def _parse_purchase_order(self, text: str) -> dict | None:
-        """Parse ✅...Purchase/Sell Order...❌ format."""
-        po_m = self.RE_PURCHASE_ORDER.search(text)
-        if not po_m:
-            return None
-
-        raw_symbol = po_m.group(1).upper().strip()
-        action_word = po_m.group(2).upper()
-
-        sym = self.SYMBOL_MAP.get(raw_symbol, raw_symbol)
-        # Also try mapping from parenthetical like (XAU/USD)
-        paren_m = re.search(r"\(([\w/]+)\)", text)
-        if paren_m:
-            paren_sym = paren_m.group(1).upper().replace("/", "")
-            sym = self.SYMBOL_MAP.get(paren_sym, paren_sym)
-
-        entry_m = self.RE_PURCHASE_ENTRY.search(text)
-        if not entry_m:
-            return None
-
-        try:
-            pa = float(entry_m.group(1))
-            pb = float(entry_m.group(2))
-        except ValueError:
-            return None
-        zl, zh = min(pa, pb), max(pa, pb)
-        zm = round((zl + zh) / 2, 2)
-
-        tps = [float(v) for v in self.RE_PURCHASE_TP.findall(text)]
-        sl_m = self.RE_PURCHASE_SL.search(text)
-        sl = float(sl_m.group(1)) if sl_m else None
-
-        if not tps or sl is None:
-            log.warning(
-                f"PurchaseOrder incomplet TPs={tps} SL={sl} | {text[:80]}"
-            )
-            return None
-
-        log.info(
-            f"PurchaseOrder → {sym} zone [{zl}—{zm}—{zh}] "
-            f"TPfinal={tps[-1]} SL={sl} ({len(tps)} TPs)"
-        )
-        return self._build_result(sym, "", zl, zm, zh, tps, sl)
-
-    def _parse_alt(self, text):
-        alt_m = self.RE_MAIN_ALT.search(text)
-        if alt_m:
-            zone_m = self.RE_ZONE_LINE.search(text)
-            if zone_m:
-                act = alt_m.group(1).upper()
-                sym = self.SYMBOL_MAP.get(
-                    alt_m.group(2).upper().replace("/", ""),
-                    alt_m.group(2).upper().replace("/", ""),
-                )
-                try:
-                    pa = float(zone_m.group(1))
-                    pb = float(zone_m.group(2))
-                except ValueError:
-                    return None
-                zl, zh = min(pa, pb), max(pa, pb)
-                zm = round((zl + zh) / 2, 2)
-                sl_m = (
-                    self.RE_SL_TARGET.search(text)
-                    or self.RE_SL_LONG.search(text)
-                    or self.RE_SL.search(text)
-                )
-                sl = float(sl_m.group(1)) if sl_m else None
-                if sl is None:
-                    return None
-                tps = self._extract_tps(text, act, zl, zh)
-                if not tps:
-                    return None
-                return self._build_result(sym, act, zl, zm, zh, tps, sl)
-
-        sl_alone = self.RE_SL_ALONE.search(text)
-        if sl_alone:
-            return {
-                "type": "SL_MOVE",
-                "new_sl": float(sl_alone.group(1)),
-            }
-
-        tp_line_vals = self.RE_TP_LINE.findall(text)
-        if tp_line_vals:
-            first = text.strip().split("\n")[0]
-            sym_m = re.search(
-                r"(XAUUSD|GOLD|XAU/USD|XAGUSD|SILVER|USOIL|OIL|BTCUSD|BTC/USD|BTC)",
-                first,
-                re.IGNORECASE,
-            )
-            dir_m = re.search(r"\b(BUY|SELL)\b", first, re.IGNORECASE)
-            zone_m = self.RE_ZONE_LINE.search(first)
-            if sym_m and dir_m and zone_m:
-                sym = self.SYMBOL_MAP.get(
-                    sym_m.group(1).upper(), sym_m.group(1).upper()
-                )
-                act = dir_m.group(1).upper()
-                try:
-                    pa = float(zone_m.group(1))
-                    pb = float(zone_m.group(2))
-                except ValueError:
-                    return None
-                zl, zh = min(pa, pb), max(pa, pb)
-                zm = round((zl + zh) / 2, 2)
-                sl_l = re.search(
-                    r"^\s*SL\s+([\d.]+)",
-                    text,
-                    re.IGNORECASE | re.MULTILINE,
-                )
-                sl = float(sl_l.group(1)) if sl_l else None
-                tps = [float(v) for v in tp_line_vals]
-                if not tps or sl is None:
-                    return None
-                return self._build_result(sym, act, zl, zm, zh, tps, sl)
-        return None
-
-    def _extract_tps(self, text, action, zone_low, zone_high, sl=None):
-        if self.RE_TARGET_OPEN.search(text):
-            # R:R-based generation if SL available
-            if sl is not None:
-                avg_entry = (zone_low + zone_high) / 2
-                risk = abs(avg_entry - sl)
-                if risk > 0:
-                    tps = []
-                    for rr in OPEN_TP_RR_RATIOS[:OPEN_TP_COUNT]:
-                        if action == "BUY":
-                            tps.append(round(avg_entry + risk * rr, 2))
-                        else:
-                            tps.append(round(avg_entry - risk * rr, 2))
-                    log.info(
-                        f"TP:Open R:R → {action} risk={risk:.1f} "
-                        f"TPs={tps}"
-                    )
-                    return tps
-            # Fallback: fixed step
-            step = 4.0
-            base = zone_high if action == "BUY" else zone_low
-            if action == "SELL":
-                return [
-                    round(base - step, 2),
-                    round(base - step * 2, 2),
-                    round(base - step * 3, 2),
-                ]
-            else:
-                return [
-                    round(base + step, 2),
-                    round(base + step * 2, 2),
-                    round(base + step * 3, 2),
-                ]
-        tps = []
-        for val in self.RE_TP.findall(text):
-            try:
-                tps.append(float(val))
-            except ValueError:
-                pass
-        if not tps:
-            for val in self.RE_TP_TAKE.findall(text):
-                try:
-                    tps.append(float(val))
-                except ValueError:
-                    pass
-        if not tps:
-            for val in self.RE_TP_LONG.findall(text):
-                try:
-                    tps.append(float(val))
-                except ValueError:
-                    pass
-        return tps
-
-    def _parse_main(self, main_m, text):
-        sym = self.SYMBOL_MAP.get(
-            main_m.group(1).upper(), main_m.group(1).upper()
-        )
-        act = main_m.group(2).upper()
-        try:
-            pa = float(main_m.group(3))
-            pb = float(main_m.group(4))
-        except ValueError:
-            log.warning(f"Valeurs invalides dans le signal: {text[:80]}")
-            return None
-
-        zl, zh = min(pa, pb), max(pa, pb)
-        zm = round((zl + zh) / 2, 2)
-
-        # SL first (needed for R:R TP generation)
-        sl_m = self.RE_SL.search(text)
-        if not sl_m:
-            sl_m = self.RE_SL_LONG.search(text)
-        sl = float(sl_m.group(1)) if sl_m else None
-
-        tps = []
-        for val in self.RE_TP.findall(text):
-            try:
-                tps.append(float(val))
-            except ValueError:
-                pass
-        if not tps:
-            for val in self.RE_TP_TAKE.findall(text):
-                try:
-                    tps.append(float(val))
-                except ValueError:
-                    pass
-        if not tps:
-            for val in self.RE_TP_LONG.findall(text):
-                try:
-                    tps.append(float(val))
-                except ValueError:
-                    pass
-        if not tps:
-            tps = self._extract_tps(text, act, zl, zh, sl=sl)
-
-        if not tps or sl is None:
-            log.warning(f"Incomplet TPs={tps} SL={sl} | {text[:80]}")
-            return None
-
-        log.info(
-            f"Parsé → {act} {sym} zone [{zl}—{zm}—{zh}] "
-            f"TPfinal={tps[-1]} SL={sl} ({len(tps)} TPs)"
-        )
-        return self._build_result(sym, act, zl, zm, zh, tps, sl)
-
-
-# =============================================================
-# MT5 BRIDGE
+# MT5 BRIDGE (v4.1 — volume min broker + group fix)
 # =============================================================
 class MT5Bridge:
 
@@ -1308,7 +451,6 @@ class MT5Bridge:
         return ORDER_FILLING_RETURN
 
     def _force_filling(self, sym_info) -> int:
-        """Essaie tous les modes de remplissage jusqu'à en trouver un qui marche."""
         candidates = [ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN]
         filling = sym_info.filling_mode
         if filling & SYMBOL_FILLING_FOK:
@@ -1326,6 +468,30 @@ class MT5Bridge:
             return None
         return tick.ask if action == "BUY" else tick.bid
 
+    def _validate_volume(self, sym_info, lot: float) -> float:
+        """Vérifie et ajuste le volume selon les contraintes du broker."""
+        vol_min = sym_info.volume_min
+        vol_max = sym_info.volume_max
+        vol_step = sym_info.volume_step
+
+        if lot < vol_min:
+            log.warning(
+                f"Lot {lot} < minimum {vol_min} → ajusté à {vol_min}"
+            )
+            lot = vol_min
+        elif lot > vol_max:
+            log.warning(
+                f"Lot {lot} > maximum {vol_max} → ajusté à {vol_max}"
+            )
+            lot = vol_max
+
+        # Arrondir au step le plus proche
+        if vol_step > 0:
+            lot = round(lot / vol_step) * vol_step
+            lot = round(lot, 8)
+
+        return lot
+
     def place_market_order(
         self, signal: dict, lot: float, tp: float
     ) -> int | None:
@@ -1334,6 +500,10 @@ class MT5Bridge:
         if not sym:
             log.error(f"[DEBUG] sym=None pour {signal['symbol']}")
             return None
+
+        # v4.2: Validation volume broker
+        lot = self._validate_volume(sym, lot)
+
         action = signal["action"]
         tick = mt5.symbol_info_tick(sym.name)
         if not tick:
@@ -1345,7 +515,6 @@ class MT5Bridge:
             mt5.ORDER_TYPE_BUY if action == "BUY" else mt5.ORDER_TYPE_SELL
         )
 
-        # Essayer tous les modes de remplissage
         filling_modes = []
         filling = sym.filling_mode
         if filling & SYMBOL_FILLING_FOK:
@@ -1368,7 +537,7 @@ class MT5Bridge:
                     "tp": round(tp, sym.digits),
                     "deviation": SLIPPAGE,
                     "magic": MAGIC_NUMBER,
-                    "comment": f"TG-market {datetime.now():%H:%M}",
+                    "comment": f"TG-market {datetime.now(timezone.utc):%H:%M}",
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": fill_mode,
                 }
@@ -1398,6 +567,10 @@ class MT5Bridge:
         sym = self._sym(signal["symbol"])
         if not sym:
             return None
+
+        # v4.2: Validation volume broker
+        lot = self._validate_volume(sym, lot)
+
         action = signal["action"]
         if action == "BUY" and tp <= price:
             return None
@@ -1420,7 +593,7 @@ class MT5Bridge:
                 "tp": round(tp, sym.digits),
                 "deviation": SLIPPAGE,
                 "magic": MAGIC_NUMBER,
-                "comment": f"TG-limit {datetime.now():%H:%M}",
+                "comment": f"TG-limit {datetime.now(timezone.utc):%H:%M}",
                 "type_time": mt5.ORDER_TIME_SPECIFIED,
                 "expiration": int(expiry.timestamp()),
                 "type_filling": filling,
@@ -1592,14 +765,13 @@ def check_conflict(signal: dict, bridge: MT5Bridge, manager) -> bool:
                 break
 
     if not conflict:
-        with manager._lock:
-            for entry in manager.active:
-                if (
-                    entry["signal"]["symbol"] == symbol
-                    and entry["signal"]["action"] == opposite
-                ):
-                    conflict = True
-                    break
+        for entry in manager.active:
+            if (
+                entry["signal"]["symbol"] == symbol
+                and entry["signal"]["action"] == opposite
+            ):
+                conflict = True
+                break
 
     if not conflict:
         return False
@@ -1607,17 +779,16 @@ def check_conflict(signal: dict, bridge: MT5Bridge, manager) -> bool:
     log.warning(
         f"CONFLIT {symbol} : entrant={new_action} existant={opposite}"
     )
-    with manager._lock:
-        to_remove = []
-        for entry in manager.active:
-            if entry["signal"]["symbol"] != symbol:
-                continue
-            for o in entry["orders"]:
-                bridge.cancel_order(o["order"])
-            to_remove.append(entry)
-        for e in to_remove:
-            if e in manager.active:
-                manager.active.remove(e)
+    to_remove = []
+    for entry in manager.active:
+        if entry["signal"]["symbol"] != symbol:
+            continue
+        for o in entry.get("orders", []):
+            bridge.cancel_order(o["order"])
+        to_remove.append(entry)
+    for e in to_remove:
+        if e in manager.active:
+            manager.active.remove(e)
     bridge.close_all(symbol=symbol)
     return True
 
@@ -1630,10 +801,10 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     zone_high = signal["zone_high"]
 
     all_tps = signal["tps"]
-    tp1 = all_tps[0]  # first TP (breakeven threshold)
-    tp_final = all_tps[-1]  # last TP (trailing target)
+    tp2 = all_tps[1] if len(all_tps) >= 2 else all_tps[0]  # TP2 pour le market
+    tp_final = all_tps[-1]  # TP final pour le limit
     sl = signal["sl"]
-    expiry = datetime.now() + timedelta(minutes=ORDER_EXPIRY_MIN)
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=ORDER_EXPIRY_MIN)
 
     if check_conflict(signal, bridge, manager):
         return
@@ -1644,6 +815,34 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
 
     current = bridge.current_price(sym_info.name, action)
     if current is None:
+        return
+
+    avg_entry = (zone_low + zone_high) / 2
+    if not SignalParser._validate_sl(action, avg_entry, sl):
+        log.error(
+            f"Signal rejeté — SL {sl} invalide pour {action} "
+            f"(entry={avg_entry})"
+        )
+        return
+
+    tick = mt5.symbol_info_tick(sym_info.name)
+    if tick:
+        spread_points = abs(tick.ask - tick.bid)
+        spread_pips = spread_points / sym_info.point
+        if spread_pips > MAX_SPREAD_POINTS:
+            log.warning(
+                f"Signal ignoré — spread trop large: {spread_pips:.0f} pts "
+                f"(max={MAX_SPREAD_POINTS}) | {sym_info.name}"
+            )
+            return
+
+    existing_positions = mt5.positions_get(symbol=sym_info.name)
+    bot_positions = [p for p in (existing_positions or []) if p.magic == MAGIC_NUMBER]
+    if len(bot_positions) >= MAX_POSITIONS:
+        log.warning(
+            f"Signal ignoré — max positions atteint ({len(bot_positions)}/{MAX_POSITIONS}) "
+            f"| {sym_info.name}"
+        )
         return
 
     in_zone = zone_low <= current <= zone_high
@@ -1660,101 +859,138 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     log.info(f"TPs={all_tps} ({len(all_tps)}) | SL={sl}")
     log.info("=" * 55)
 
-    # Distribute lot across TPs
-    n_tps = len(all_tps)
-    lot_per_tp = round(LOT_SIZE / n_tps, 2)
-    if lot_per_tp < 0.01:
-        lot_per_tp = 0.01
-    log.info(f"Lot total={LOT_SIZE} → {lot_per_tp} × {n_tps} positions")
-
     orders, tickets = [], []
 
     if in_zone:
-        # CAS 1: market order per TP
-        for i, tp_val in enumerate(all_tps):
-            tp_name = f"TP{i+1}"
-            log.info(f"[DEBUG] Market {tp_name} lot={lot_per_tp} tp={tp_val}")
-            try:
-                t = bridge.place_market_order(signal, lot_per_tp, tp=tp_val)
-            except Exception as e:
-                log.error(f"[DEBUG] EXCEPTION {tp_name}: {e}")
-                t = None
-            if t:
-                tickets.append(
-                    {
-                        "ticket": t,
-                        "lot": lot_per_tp,
-                        "role": f"market_tp{i+1}",
-                        "entry_price": current,
-                        "signal_tp1": tp1,
-                        "tp_index": i,
-                        "tp_target": tp_val,
-                        "tp1": tp1,
-                        "tp2": tp_final,
-                        "sl_step": 0,
-                        "trail_active": False,
-                    }
-                )
-            log.info(f"CAS 1 → {tp_name} MARKET {lot_per_tp} TP={tp_val}")
+        # ─────────────────────────────────────────────
+        # CAS 1: Prix dans la zone
+        # 1 × MARKET avec TP=TP2
+        # 1 × LIMIT entre SL et zone avec TP=TP_final
+        # ─────────────────────────────────────────────
 
-        # Also place a limit at zone edge (averaging if retrace)
-        limit_price = zone_high if action == "SELL" else zone_low
-        o1 = bridge.place_limit_order(
-            signal, lot_per_tp, limit_price, tp_final, expiry
-        )
-        if o1:
-            orders.append(
-                {
-                    "order": o1,
-                    "lot": lot_per_tp,
-                    "price": limit_price,
-                    "role": "limit_cas1",
-                    "signal_tp1": tp1,
-                    "tp_index": n_tps - 1,
-                    "tp_target": tp_final,
-                    "tp1": tp1,
-                    "tp2": tp_final,
-                    "sl_step": 0,
-                    "trail_active": False,
-                }
-            )
-    else:
-        # CAS 2: limit orders per TP
-        if action == "BUY":
-            dist = zone_low - sl
-            pa = round(zone_low - dist / 3, sym_info.digits)
-            edge_prices = [zone_high, pa]
+        # Lot split: 70% market, 30% limit
+        lot_market = round(LOT_SIZE * 0.7, 2)
+        lot_limit = round(LOT_SIZE * 0.3, 2)
+
+        # Ajuster au volume minimum du broker
+        if lot_market < sym_info.volume_min:
+            lot_market = sym_info.volume_min
+        if lot_limit < sym_info.volume_min:
+            lot_limit = sym_info.volume_min
+
+        # 1) MARKET order avec TP=TP2
+        log.info(f"CAS 1 → MARKET {action} lot={lot_market} TP={tp2} SL={sl}")
+        try:
+            t = bridge.place_market_order(signal, lot_market, tp=tp2)
+        except Exception as e:
+            log.error(f"MARKET EXCEPTION: {e}")
+            t = None
+
+        market_entry_price = current
+        if t:
+            tickets.append({
+                "ticket": t,
+                "lot": lot_market,
+                "role": "market_tp2",
+                "entry_price": market_entry_price,
+                "tp_index": 1,
+                "tp_target": tp2,
+                "tp1": tp2,
+                "tp2": tp_final,
+                "sl_step": 0,
+                "trail_active": False,
+            })
+            log.info(f"  ✓ MARKET #{t} @{market_entry_price} TP={tp2}")
         else:
-            dist = sl - zone_high
-            pa = round(zone_high + dist / 3, sym_info.digits)
-            edge_prices = [zone_low, pa]
+            log.error("  ✗ MARKET échoué")
 
-        for ep_idx, edge_price in enumerate(edge_prices):
-            role = "limit_high" if ep_idx == 0 else "limit_low"
-            for i, tp_val in enumerate(all_tps):
-                tp_name = f"TP{i+1}"
-                o = bridge.place_limit_order(
-                    signal, lot_per_tp, edge_price, tp_val, expiry
-                )
-                if o:
-                    orders.append(
-                        {
-                            "order": o,
-                            "lot": lot_per_tp,
-                            "price": edge_price,
-                            "role": f"{role}_tp{i+1}",
-                            "signal_tp1": tp1,
-                            "tp_index": i,
-                            "tp_target": tp_val,
-                            "tp1": tp1,
-                            "tp2": tp_final,
-                            "sl_step": 0,
-                            "trail_active": False,
-                        }
-                    )
-                log.info(
-                    f"CAS 2 → {tp_name} LIMIT {lot_per_tp} @{edge_price} TP={tp_val}"
-                )
+        # 2) LIMIT order entre SL et zone, TP=TP_final
+        if action == "BUY":
+            limit_price = round((sl + zone_low) / 2, sym_info.digits)
+        else:
+            limit_price = round((zone_high + sl) / 2, sym_info.digits)
+
+        log.info(f"CAS 1 → LIMIT {action} @{limit_price} lot={lot_limit} TP={tp_final} SL={sl}")
+        o = bridge.place_limit_order(signal, lot_limit, limit_price, tp_final, expiry)
+        if o:
+            orders.append({
+                "order": o,
+                "lot": lot_limit,
+                "price": limit_price,
+                "role": "limit_catch",
+                "tp_index": len(all_tps) - 1,
+                "tp_target": tp_final,
+                "tp1": tp2,
+                "tp2": tp_final,
+                "sl_step": 0,
+                "trail_active": False,
+                "_market_entry_price": market_entry_price,  # Pour BE si limit exécuté
+            })
+            log.info(f"  ✓ LIMIT #{o} @{limit_price} TP={tp_final}")
+        else:
+            log.error(f"  ✗ LIMIT échoué @{limit_price}")
+
+    else:
+        # ─────────────────────────────────────────────
+        # CAS 2: Prix hors zone
+        # 2 × LIMIT: zone_edge + zone_opposite, TP=TP_final pour les 2
+        # Le code gère la fermeture/BE/trailing à TP2
+        # ─────────────────────────────────────────────
+
+        lot_per_order = round(LOT_SIZE / 2, 2)
+        if lot_per_order < sym_info.volume_min:
+            lot_per_order = sym_info.volume_min
+
+        if action == "BUY":
+            # Prix au-dessus de la zone → limit en dessous
+            price_1 = zone_high   # zone edge (plus proche du prix)
+            price_2 = zone_low    # zone opposite (plus loin)
+        else:
+            # Prix en dessous de la zone → limit au-dessus
+            price_1 = zone_low    # zone edge (plus proche du prix)
+            price_2 = zone_high   # zone opposite (plus loin)
+
+        # Limit 1: zone_edge → TP=TP_final (code gère la sortie à TP2)
+        log.info(f"CAS 2 → LIMIT_1 {action} @{price_1} lot={lot_per_order} TP={tp_final} SL={sl}")
+        o1 = bridge.place_limit_order(signal, lot_per_order, price_1, tp_final, expiry)
+        if o1:
+            tp_idx_1 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
+            orders.append({
+                "order":      o1,
+                "lot":        lot_per_order,
+                "price":      price_1,
+                "role":       "limit_1",
+                "tp_index":   tp_idx_1,
+                "tp_target":  tp_final,
+                "tp1":        tp2,
+                "tp2":        tp_final,
+                "sl_step":    0,
+                "trail_active": False,
+            })
+            log.info(f"  ✓ LIMIT_1 #{o1} @{price_1} TP={tp_final}")
+        else:
+            log.error(f"  ✗ LIMIT_1 échoué @{price_1}")
+
+        # Limit 2: zone_opposite → TP=TP_final
+        log.info(f"CAS 2 → LIMIT_2 {action} @{price_2} lot={lot_per_order} TP={tp_final} SL={sl}")
+        o2 = bridge.place_limit_order(signal, lot_per_order, price_2, tp_final, expiry)
+        if o2:
+            tp_idx_2 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
+            orders.append({
+                "order":      o2,
+                "lot":        lot_per_order,
+                "price":      price_2,
+                "role":       "limit_2",
+                "tp_index":   tp_idx_2,
+                "tp_target":  tp_final,
+                "tp1":        tp2,
+                "tp2":        tp_final,
+                "sl_step":    0,
+                "trail_active": False,
+            })
+            log.info(f"  ✓ LIMIT_2 #{o2} @{price_2} TP={tp_final}")
+        else:
+            log.error(f"  ✗ LIMIT_2 échoué @{price_2}")
 
     if not orders and not tickets:
         log.error("Aucun ordre placé.")
@@ -1765,12 +1001,11 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         "orders": orders,
         "tickets": tickets,
         "expiry": expiry,
-        "_open_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "_open_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
     }
     manager.register(entry)
     tracker.log_trade_open(entry)
 
-    # Log to Supabase
     if _supa_connected and _supa:
         ticket_ids = [t["ticket"] for t in tickets]
         supa_trade_id = _supa.log_trade_open(
@@ -1781,8 +1016,9 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         )
         entry["_supa_trade_id"] = supa_trade_id
 
+
 # =============================================================
-# TRADE MANAGER
+# TRADE MANAGER (v4.2 — async-safe)
 # =============================================================
 class TradeManager:
 
@@ -1790,10 +1026,13 @@ class TradeManager:
         self.bridge = bridge
         self.reporter = reporter
         self.active = []
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()  # FIX: thread-safe (to_thread) au lieu de asyncio.Lock
         self._stop = False
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        self._task = None
+
+    async def start(self):
+        """Démarre la boucle de monitoring en tant que tâche asyncio."""
+        self._task = asyncio.create_task(self._loop_async())
 
     def register(self, entry: dict):
         with self._lock:
@@ -1808,22 +1047,29 @@ class TradeManager:
 
     def stop(self):
         self._stop = True
+        if self._task:
+            self._task.cancel()
 
-    def _loop(self):
+    async def _loop_async(self):
+        """Boucle async avec asyncio.to_thread pour les appels MT5 bloquants."""
         while not self._stop:
-            time.sleep(10)
+            await asyncio.sleep(10)
             try:
-                self._check_all()
+                await asyncio.to_thread(self._check_all)
             except Exception as exc:
                 log.error(f"TradeManager erreur: {exc}")
 
     def _get_last_pnl(self, ticket: int, symbol: str) -> float:
-        since = datetime.now() - timedelta(hours=24)
-        deals = mt5.history_deals_get(since, datetime.now(), group=symbol)
+        """Get P&L for a closed position. Filtre post-requête par symbole exact."""
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        # v4.2: Pas de group=symbol (pattern regex dangereux)
+        deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
         if deals:
             for deal in reversed(deals):
-                if deal.position_id == ticket:
-                    return deal.profit
+                # Filtre exact par symbole + position_id ou order
+                if deal.symbol == symbol and (deal.position_id == ticket or deal.order == ticket):
+                    if deal.entry == mt5.DEAL_ENTRY_OUT:
+                        return deal.profit
         return 0.0
 
     def _get_pos(self, ticket: int):
@@ -1831,8 +1077,8 @@ class TradeManager:
         return r[0] if r else None
 
     def _resolve_order(self, order_ticket: int, symbol: str):
-        since = datetime.now() - timedelta(hours=24)
-        deals = mt5.history_deals_get(since, datetime.now(), group=symbol)
+        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
         if not deals:
             return None
         for deal in deals:
@@ -1852,7 +1098,7 @@ class TradeManager:
             log.warning("Reporter non initialisé, rapport ignoré")
 
     def _check_all(self):
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         to_remove = []
 
         with self._lock:
@@ -1865,33 +1111,32 @@ class TradeManager:
 
             # Resolve pending limit orders → tickets
             still_pending = []
-            with self._lock:
-                for o in entry["orders"]:
-                    pos = self._resolve_order(o["order"], symbol)
-                    if pos:
-                        tk = {
-                            "ticket": pos.ticket,
-                            "lot": o["lot"],
-                            "role": o["role"],
-                            "entry_price": pos.price_open,
-                            "signal_tp1": o.get("signal_tp1", 0),
-                            "tp_index": o.get("tp_index", 0),
-                            "tp_target": o.get("tp_target", 0),
-                            "tp1": o["tp1"],
-                            "tp2": o["tp2"],
-                            "sl_step": 0,
-                            "trail_active": False,
-                        }
-                        entry["tickets"].append(tk)
-                        log.info(
-                            f"Ordre #{o['order']} rempli → "
-                            f"ticket={pos.ticket} @{pos.price_open}"
-                        )
-                    elif now > entry["expiry"]:
-                        self.bridge.cancel_order(o["order"])
-                    else:
-                        still_pending.append(o)
-                entry["orders"] = still_pending
+            for o in entry["orders"]:
+                pos = self._resolve_order(o["order"], symbol)
+                if pos:
+                    tk = {
+                        "ticket": pos.ticket,
+                        "lot": o["lot"],
+                        "role": o["role"],
+                        "entry_price": pos.price_open,
+                        "signal_tp1": o.get("signal_tp1", 0),
+                        "tp_index": o.get("tp_index", 0),
+                        "tp_target": o.get("tp_target", 0),
+                        "tp1": o["tp1"],
+                        "tp2": o["tp2"],
+                        "sl_step": 0,
+                        "trail_active": False,
+                    }
+                    entry["tickets"].append(tk)
+                    log.info(
+                        f"Ordre #{o['order']} rempli → "
+                        f"ticket={pos.ticket} @{pos.price_open}"
+                    )
+                elif now > entry["expiry"]:
+                    self.bridge.cancel_order(o["order"])
+                else:
+                    still_pending.append(o)
+            entry["orders"] = still_pending
 
             active_tks = [
                 t for t in entry["tickets"] if self._get_pos(t["ticket"])
@@ -1946,31 +1191,226 @@ class TradeManager:
                             if supa_id:
                                 _supa.log_sl_hit(supa_id, pnl)
 
-            # After first TP hit: move SL to breakeven + activate trailing
+            # ─────────────────────────────────────────
+            # CAS 1: TP2 hité → gérer le limit_catch
+            # Vérifier que le market a bien atteint TP2 (pas SL)
+            # ─────────────────────────────────────────
+            market_tk = None
+            for t in entry["tickets"]:
+                if t.get("role") == "market_tp2" and t.get("_reported") and t.get("_last_pnl", 0) >= 0:
+                    market_tk = t
+                    break
+
+            if market_tk:
+                market_entry = market_tk.get("entry_price", 0)
+
+                # Chercher le limit dans les tickets déjà résolus
+                limit_ticket = None
+                for tk in entry["tickets"]:
+                    if tk.get("role") == "limit_catch":
+                        limit_ticket = tk
+                        break
+
+                # Chercher le limit encore pending dans orders
+                limit_order = None
+                for o in entry["orders"]:
+                    if o.get("role") == "limit_catch":
+                        limit_order = o
+                        break
+
+                if limit_ticket:
+                    # Scénario 2: Limit exécuté → BE + Trailing
+                    pos = self._get_pos(limit_ticket["ticket"])
+                    if pos:
+                        log.info(
+                            f"CAS 1 TP2 hité → Limit #{limit_ticket['ticket']} exécuté "
+                            f"@{pos.price_open} → SL vers BE ({market_entry})"
+                        )
+                        self.bridge.modify_sl(
+                            limit_ticket["ticket"],
+                            market_entry,
+                            label="[BE after TP2]"
+                        )
+                        limit_ticket["trail_active"] = True
+                        limit_ticket["sl_step"] = 1
+                        log.info(f"Trail activé #{limit_ticket['ticket']} après TP2")
+                    else:
+                        log.info(
+                            f"CAS 1 TP2 hité → Limit #{limit_ticket['ticket']} déjà fermé"
+                        )
+
+                elif limit_order:
+                    # Vérifier si le limit pending vient d'être exécuté
+                    pos = self._resolve_order(limit_order["order"], symbol)
+                    if pos:
+                        log.info(
+                            f"CAS 1 TP2 hité → Limit #{limit_order['order']} exécuté "
+                            f"@{pos.price_open} → SL vers BE ({market_entry})"
+                        )
+                        self.bridge.modify_sl(
+                            pos.ticket,
+                            market_entry,
+                            label="[BE after TP2]"
+                        )
+                        # Déplacer de orders vers tickets
+                        tk = {
+                            "ticket": pos.ticket,
+                            "lot": limit_order["lot"],
+                            "role": "limit_catch",
+                            "entry_price": pos.price_open,
+                            "tp_index": limit_order.get("tp_index", 0),
+                            "tp_target": limit_order.get("tp_target", 0),
+                            "tp1": limit_order["tp1"],
+                            "tp2": limit_order["tp2"],
+                            "sl_step": 1,
+                            "trail_active": True,
+                        }
+                        entry["tickets"].append(tk)
+                        entry["orders"].remove(limit_order)
+                        log.info(f"Trail activé #{pos.ticket} après TP2")
+                    else:
+                        # Scénario 1: Limit PAS exécuté → annuler
+                        log.info(
+                            f"CAS 1 TP2 hité → Limit #{limit_order['order']} non exécuté → annulation"
+                        )
+                        self.bridge.cancel_order(limit_order["order"])
+                        entry["orders"].remove(limit_order)
+
+            # ─────────────────────────────────────────
+            # CAS 2: Prix atteint TP2 → gérer limit_1 et limit_2
+            # Les 2 limits ont TP=TP_final, le code gère la sortie à TP2
+            # Option A: aucun rempli → annuler les 2
+            # Option B: limit_1 remplie → annuler limit_2, trailing sur limit_1
+            # Option C: les 2 remplies → fermer limit_1, SL limit_2 → entrée L1, trailing sur L2
+            # ─────────────────────────────────────────
+
+            # Récupérer le niveau TP2 depuis l'entrée (tp1 = TP2 du signal)
+            cas2_tp2_level = 0
+            for t in entry["tickets"]:
+                if t.get("tp1"):
+                    cas2_tp2_level = t["tp1"]
+                    break
+
+            # Déclencheur : prix a atteint TP2
+            cas2_tp2_hit = False
+            if cas2_tp2_level > 0:
+                if action == "BUY" and current >= cas2_tp2_level:
+                    cas2_tp2_hit = True
+                elif action == "SELL" and current <= cas2_tp2_level:
+                    cas2_tp2_hit = True
+
+            if cas2_tp2_hit:
+                # Trouver limit_1 dans les tickets (remplie) et les orders (pending)
+                cas2_limit1_tk = None
+                for tk in entry["tickets"]:
+                    if tk.get("role") == "limit_1":
+                        cas2_limit1_tk = tk
+                        break
+                cas2_limit1_order = None
+                for o in entry["orders"]:
+                    if o.get("role") == "limit_1":
+                        cas2_limit1_order = o
+                        break
+
+                # Trouver limit_2 dans les tickets (remplie) et les orders (pending)
+                limit2_ticket = None
+                for tk in entry["tickets"]:
+                    if tk.get("role") == "limit_2":
+                        limit2_ticket = tk
+                        break
+                limit2_order = None
+                for o in entry["orders"]:
+                    if o.get("role") == "limit_2":
+                        limit2_order = o
+                        break
+
+                # Vérifier si chaque limit a été remplie (a un ticket avec entry_price)
+                limit1_was_filled = cas2_limit1_tk is not None and cas2_limit1_tk.get("entry_price", 0) > 0
+                limit2_was_filled = limit2_ticket is not None and limit2_ticket.get("entry_price", 0) > 0
+
+                if not limit1_was_filled and not limit2_was_filled:
+                    # Option A: aucun ordre rempli → annuler TOUS les ordres pending
+                    log.info("CAS 2 Option A → prix a atteint TP2 sans remplir les limits → annuler tout")
+                    for o in list(entry["orders"]):
+                        if o.get("role") in ("limit_1", "limit_2"):
+                            self.bridge.cancel_order(o["order"])
+                            entry["orders"].remove(o)
+
+                elif limit1_was_filled and not limit2_was_filled:
+                    # Option B: limit_1 remplie, limit_2 jamais remplie
+                    # → annuler limit_2 pending + SL de limit_1 → BE + trailing vers TP_final
+                    log.info("CAS 2 Option B → limit_1 remplie, prix a atteint TP2")
+                    if limit2_order:
+                        log.info("  → annuler limit_2 pending")
+                        self.bridge.cancel_order(limit2_order["order"])
+                        entry["orders"].remove(limit2_order)
+                    if cas2_limit1_tk:
+                        limit1_entry = cas2_limit1_tk.get("entry_price", 0)
+                        pos1 = self._get_pos(cas2_limit1_tk["ticket"])
+                        if pos1:
+                            log.info(
+                                f"  → SL limit_1 → BE ({limit1_entry}) + trailing vers TP_final"
+                            )
+                            self.bridge.modify_sl(
+                                cas2_limit1_tk["ticket"],
+                                limit1_entry,
+                                label="[BE CAS2]"
+                            )
+                            cas2_limit1_tk["trail_active"] = True
+                            cas2_limit1_tk["sl_step"] = 1
+
+                elif limit1_was_filled and limit2_was_filled:
+                    # Option C: les 2 remplies → fermer limit_1 manuellement à TP2
+                    # → SL de limit_2 → entrée de limit_1 + trailing vers TP_final
+                    limit1_entry = cas2_limit1_tk.get("entry_price", 0) if cas2_limit1_tk else 0
+                    log.info(
+                        f"CAS 2 Option C → les 2 remplies, prix a atteint TP2 "
+                        f"→ fermer limit_1 + SL limit_2 → BE ({limit1_entry}) + trailing vers TP_final"
+                    )
+                    # Fermer limit_1 manuellement (pas de TP sur limit_1, broker ne ferme pas)
+                    if cas2_limit1_tk and self._get_pos(cas2_limit1_tk["ticket"]):
+                        self.bridge.close_position(
+                            cas2_limit1_tk["ticket"],
+                            comment="CAS2-TP2-manual-close"
+                        )
+                    # SL de limit_2 → entrée de limit_1 + trailing
+                    if limit2_ticket:
+                        pos2 = self._get_pos(limit2_ticket["ticket"])
+                        if pos2 and limit1_entry > 0:
+                            self.bridge.modify_sl(
+                                limit2_ticket["ticket"],
+                                limit1_entry,
+                                label="[BE CAS2 after L1 close]"
+                            )
+                            limit2_ticket["trail_active"] = True
+                            limit2_ticket["sl_step"] = 1
+                            log.info(f"  → Trail activé sur limit_2 #{limit2_ticket['ticket']} vers TP_final")
+
+            # After first TP hit: move SL to breakeven for positions in profit
             if tp_indices_closed and 0 in tp_indices_closed:
                 for t in entry["tickets"]:
                     if self._get_pos(t["ticket"]) and t.get("sl_step", 0) == 0:
                         ep = t.get("entry_price", 0)
-                        self.bridge.modify_sl(
-                            t["ticket"], ep, label="[BE after TP1]"
-                        )
-                        t["sl_step"] = 1
-                        log.info(
-                            f"BE activé #{t['ticket']} → SL={ep}"
-                        )
-
-            # After OPEN_TRAIL_AFTER_TP TPs: activate trailing
-            min_trail_tp = OPEN_TRAIL_AFTER_TP - 1
-            if any(idx >= min_trail_tp for idx in tp_indices_closed):
-                for t in entry["tickets"]:
-                    if self._get_pos(t["ticket"]) and not t.get("trail_active"):
-                        t["trail_active"] = True
-                        t["sl_step"] = 1
-                        log.info(
-                            f"Trail activé #{t['ticket']}"
-                        )
+                        if action == "BUY" and current > ep:
+                            self.bridge.modify_sl(
+                                t["ticket"], ep, label="[BE after TP1]"
+                            )
+                            t["sl_step"] = 1
+                            log.info(f"BE activé #{t['ticket']} → SL={ep}")
+                        elif action == "SELL" and current < ep:
+                            self.bridge.modify_sl(
+                                t["ticket"], ep, label="[BE after TP1]"
+                            )
+                            t["sl_step"] = 1
+                            log.info(f"BE activé #{t['ticket']} → SL={ep}")
+                        else:
+                            log.info(
+                                f"BE reporté #{t['ticket']} — "
+                                f"prix={current} entry={ep} (pas encore en profit)"
+                            )
 
             # Trailing SL update for active positions
+            # (activation is handled by CAS 1/CAS 2 specific code above)
             for t in entry["tickets"]:
                 if not t.get("trail_active"):
                     continue
@@ -1989,18 +1429,18 @@ class TradeManager:
                 gap = TRAIL_POINTS * pv
                 if action == "BUY":
                     nsl = current - gap
-                    if nsl > pos.sl:
+                    if pos.sl == 0 or nsl > pos.sl:
                         self.bridge.modify_sl(
                             t["ticket"],
-                            nsl,
+                            round(nsl, d),
                             label="[Trail BUY]",
                         )
                 else:
                     nsl = current + gap
-                    if nsl < pos.sl or pos.sl == 0:
+                    if pos.sl == 0 or nsl < pos.sl:
                         self.bridge.modify_sl(
                             t["ticket"],
-                            nsl,
+                            round(nsl, d),
                             label="[Trail SELL]",
                         )
 
@@ -2022,23 +1462,130 @@ class TradeManager:
                 self._schedule_report(
                     self.reporter.on_trade_closed(entry, total_pnl)
                 )
-                # Log dans le tracker
                 if hasattr(self, "tracker") and self.tracker:
                     self.tracker.log_trade_close(entry, total_pnl)
-                # Log dans Supabase
                 if _supa_connected and _supa:
                     supa_id = entry.get("_supa_trade_id")
                     if supa_id:
                         result_str = "WIN" if total_pnl > 0 else ("BE" if total_pnl == 0 else "LOSS")
-                        open_date = entry.get("_open_date", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                        open_date = entry.get("_open_date", datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
                         try:
-                            duree = (datetime.now() - datetime.strptime(open_date, "%Y-%m-%d %H:%M:%S")).total_seconds() / 60
+                            # FIX: parser avec timezone pour éviter TypeError naive vs aware
+                            open_dt = datetime.strptime(open_date, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                            duree = (datetime.now(timezone.utc) - open_dt).total_seconds() / 60
                         except Exception:
                             duree = 0
                         _supa.log_trade_close(supa_id, result_str, total_pnl, duree)
                 with self._lock:
                     if entry in self.active:
                         self.active.remove(entry)
+
+
+# =============================================================
+# TRADE REPORTER
+# =============================================================
+class TradeReporter:
+
+    def __init__(self):
+        self._tg_client = None
+        self._report_entity = None
+        self._loop = None
+
+    async def set_telegram_client(self, client: TelegramClient):
+        self._tg_client = client
+        self._loop = asyncio.get_running_loop()
+        if REPORT_CHANNEL:
+            try:
+                self._report_entity = await client.get_entity(REPORT_CHANNEL)
+                log.info(
+                    f"Canal de rapport : "
+                    f"{getattr(self._report_entity, 'title', REPORT_CHANNEL)}"
+                )
+            except Exception as e:
+                log.warning(f"Canal de rapport introuvable : {e}")
+                self._report_entity = None
+
+    async def send_tg(self, message: str):
+        if self._tg_client and self._report_entity:
+            try:
+                await self._tg_client.send_message(
+                    self._report_entity, message
+                )
+            except Exception as e:
+                log.error(f"Erreur envoi rapport TG : {e}")
+
+    async def on_order_opened(self, entry):
+        sig = entry["signal"]
+        canal = sig.get("source_channel", "Inconnu")
+        zone = f"{sig['zone_low']}-{sig['zone_high']}"
+        all_tps = sig["tps"]
+        tps_str = ", ".join([f"TP{i + 1}={v}" for i, v in enumerate(all_tps)])
+
+        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
+        msg = (
+            f"🟢 ORDRE OUVERT {mode_tag}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"📍 Zone : {zone}\n"
+            f"❌ SL : {sig['sl']}\n"
+            f"🎯 {tps_str}\n"
+            f"📦 Lot : {LOT_SIZE} × {len(entry['tickets'])} position(s)\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
+
+    async def on_tp_reached(self, ticket, sig, tp_name, tp_value, pnl):
+        canal = sig.get("source_channel", "Inconnu")
+        msg = (
+            f"🎯 {tp_name} ATTEINT\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"🎯 {tp_name} : {tp_value}\n"
+            f"💰 P&L : {pnl:+.2f} $\n"
+            f"🎫 Ticket : #{ticket}\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
+
+    async def on_sl_hit(self, ticket, sig, pnl):
+        canal = sig.get("source_channel", "Inconnu")
+        zone = f"{sig['zone_low']}-{sig['zone_high']}"
+        msg = (
+            f"🔴 SL TOUCHÉ\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"📍 Zone : {zone}\n"
+            f"❌ SL : {sig['sl']}\n"
+            f"💸 P&L : {pnl:+.2f} $\n"
+            f"🎫 Ticket : #{ticket}\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
+
+    async def on_trade_closed(self, entry, total_pnl):
+        sig = entry["signal"]
+        canal = sig.get("source_channel", "Inconnu")
+        zone = f"{sig['zone_low']}-{sig['zone_high']}"
+        emoji = "✅" if total_pnl >= 0 else "❌"
+        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
+        msg = (
+            f"{emoji} TRADE FERMÉ {mode_tag}\n"
+            f"━━━━━━━━━━━━━━━━━━\n"
+            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
+            f"📡 Canal : {canal}\n"
+            f"📊 {sig['symbol']} {sig['action']}\n"
+            f"📍 Zone : {zone}\n"
+            f"❌ SL : {sig['sl']}\n"
+            f"💰 P&L TOTAL : {total_pnl:+.2f} $\n"
+            f"━━━━━━━━━━━━━━━━━━"
+        )
+        await self.send_tg(msg)
 
 
 # =============================================================
@@ -2059,7 +1606,7 @@ async def shutdown_watcher(reporter, tracker, bridge, manager, news_mgr):
     )
 
     while not _shutdown_event.is_set():
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         remaining = (end_time - now).total_seconds() / 60
 
         if remaining <= SHUTDOWN_MARGIN_MIN and not _report_sent:
@@ -2072,11 +1619,8 @@ async def shutdown_watcher(reporter, tracker, bridge, manager, news_mgr):
             log.info("[SHUTDOWN] Rapport envoyé. Le bot continue...")
             break
 
-        # Heartbeat toutes les 5 minutes
         if int(remaining) % 5 == 0 and remaining > SHUTDOWN_MARGIN_MIN:
-            log.info(
-                f"[SHUTDOWN] Reste {remaining:.0f} min"
-            )
+            log.info(f"[SHUTDOWN] Reste {remaining:.0f} min")
 
         await asyncio.sleep(30)
 
@@ -2107,11 +1651,14 @@ async def main():
         log.critical("Bot arrêté — corrigez MT5 puis relancez.")
         return
 
+    # v4.2: TradeManager async
     manager = TradeManager(bridge, reporter)
-    manager.tracker = tracker  # ← Attacher le tracker au manager
+    manager.tracker = tracker
+    await manager.start()
 
     news_mgr = NewsManager(bridge)
     news_mgr.set_manager(manager)
+    await news_mgr.start()
 
     client = TelegramClient("session_trading", API_ID, API_HASH)
     await client.start()
@@ -2119,16 +1666,13 @@ async def main():
 
     await reporter.set_telegram_client(client)
 
-    # SIGTERM handler
     loop = asyncio.get_running_loop()
     try:
         loop.add_signal_handler(signal.SIGTERM, sigterm_handler)
         log.info("[SHUTDOWN] SIGTERM handler installé")
     except NotImplementedError:
-        # Windows ne supporte pas add_signal_handler
         signal.signal(signal.SIGTERM, lambda s, f: sigterm_handler())
         log.info("[SHUTDOWN] SIGTERM handler installé (fallback)")
-
 
     chats = []
 
@@ -2139,9 +1683,6 @@ async def main():
         ("TG_CHANNEL_4", CHANNEL_NAME_4),
     ]
 
-    # ------------------------------------------------------------------
-    # SUPABASE SESSION START
-    # ------------------------------------------------------------------
     channel_list = [ch for _, ch in channel_names if ch]
     if _supa_connected and _supa:
         _supa.start_session(
@@ -2197,24 +1738,24 @@ async def main():
             return
 
         elif signal_data["type"] == "TRADE":
-            blocked, desc = in_blocked_window()
-            if blocked:
-                log.info(f"[TIME] Signal ignoré — {desc}")
-                return
+            # ⚠️ FILTRE HORAIRE DÉSACTIVÉ TEMPORAIREMENT (v4.2-patch)
+            # blocked, desc = in_blocked_window()
+            # if blocked:
+            #     log.info(f"[TIME] Signal ignoré — {desc}")
+            #     return
             if NEWS_ENABLED and news_mgr.is_blocked():
                 log.info("[NEWS] Signal ignoré — protection news")
                 return
             execute_signal(signal_data, bridge, manager, tracker)
-            with manager._lock:
-                for entry in manager.active:
-                    if entry["signal"] is signal_data:
-                        await reporter.on_order_opened(entry)
-                        break
+            for entry in manager.active:
+                if entry["signal"] is signal_data:
+                    await reporter.on_order_opened(entry)
+                    break
 
     # Banner
     mode = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
     log.info("=" * 55)
-    log.info(f" TRADINGBOT V4.0 — {mode}")
+    log.info(f" TRADINGBOT V4.1 — {mode}")
     log.info(f" Canaux surveillés : {len(chats)}")
     for env_name, ch_value in channel_names:
         if ch_value:
@@ -2224,21 +1765,19 @@ async def main():
     log.info(f" Lot : {LOT_SIZE}")
     log.info(f" Trail SL : {TRAIL_POINTS} pts")
     log.info(f" News filter : {'ON' if NEWS_ENABLED else 'OFF'}")
-    log.info(f" Time filter : {'ON' if TIME_FILTER_ENABLED else 'OFF'}")
+    log.info(f" Time filter : OFF (désactivé temporairement)")
     if RUNTIME_MINUTES > 0:
         end = START_TIME + timedelta(minutes=RUNTIME_MINUTES)
         log.info(f" Session : {RUNTIME_MINUTES} min (fin {end:%H:%M})")
-    log.info(f" Performance : CSV + rapports activés")
+    log.info(f" Performance : Supabase + rapports Telegram")
     log.info("=" * 55)
 
     try:
-        # Lancer le timer de shutdown en arrière-plan
         shutdown_task = asyncio.create_task(
             shutdown_watcher(reporter, tracker, bridge, manager, news_mgr)
         )
         await client.run_until_disconnected()
     finally:
-        # Rapport final si pas encore envoyé
         if not _report_sent and reporter._tg_client:
             _report_sent = True
             log.info("[SHUTDOWN] Envoi du rapport final (finally)...")

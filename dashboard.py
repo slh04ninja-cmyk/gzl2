@@ -1,5 +1,5 @@
 """
-Trading Bot Dashboard — Streamlit V4 (DEBUG VERSION)
+Trading Bot Dashboard — Streamlit V4.2
 """
 import streamlit as st
 import pandas as pd
@@ -9,6 +9,13 @@ from supabase import create_client
 import os
 from datetime import datetime, timedelta
 
+# v4.2: streamlit-autorefresh au lieu de meta refresh
+try:
+    from streamlit_autorefresh import st_autorefresh
+    _HAS_AUTOREFRESH = True
+except ImportError:
+    _HAS_AUTOREFRESH = False
+
 st.set_page_config(
     page_title="Trading Bot V4 Dashboard",
     page_icon="🤖",
@@ -17,42 +24,45 @@ st.set_page_config(
 )
 
 # ============================================================
-# DEBUG: Afficher les secrets disponibles
+# AUTO-REFRESH (v4.2)
 # ============================================================
-st.sidebar.title("🔧 Debug")
-
-# Vérifier si les secrets sont présents
-has_url = False
-has_key = False
-supabase_url = ""
-supabase_key = ""
-
-try:
-    # Essayer st.secrets d'abord
-    supabase_url = st.secrets.get("SUPABASE_URL", "")
-    supabase_key = st.secrets.get("SUPABASE_ANON_KEY", "")
-    has_url = bool(supabase_url)
-    has_key = bool(supabase_key)
-    st.sidebar.success("✅ Secrets lus via st.secrets")
-except Exception as e:
-    st.sidebar.error(f"❌ Erreur st.secrets: {e}")
-    # Fallback sur os.getenv
-    supabase_url = os.getenv("SUPABASE_URL", "")
-    supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
-    has_url = bool(supabase_url)
-    has_key = bool(supabase_key)
-    st.sidebar.warning("⚠️ Fallback sur os.getenv")
-
-st.sidebar.write(f"URL présente: {has_url}")
-st.sidebar.write(f"KEY présente: {has_key}")
-
-if has_url:
-    st.sidebar.write(f"URL (masquée): {supabase_url[:20]}...")
+if _HAS_AUTOREFRESH:
+    st_autorefresh(interval=30 * 1000, key="refresh")
+else:
+    # Fallback: meta refresh via HTML
+    st.markdown(
+        '<meta http-equiv="refresh" content="30">',
+        unsafe_allow_html=True,
+    )
 
 # ============================================================
-# Si pas de secrets, afficher l'erreur et arrêter
+# CONNEXION SUPABASE
 # ============================================================
-if not has_url or not has_key:
+@st.cache_resource
+def get_supabase():
+    supabase_url = ""
+    supabase_key = ""
+
+    try:
+        supabase_url = st.secrets.get("SUPABASE_URL", "")
+        supabase_key = st.secrets.get("SUPABASE_ANON_KEY", "")
+    except Exception:
+        supabase_url = os.getenv("SUPABASE_URL", "")
+        supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
+
+    if not supabase_url or not supabase_key:
+        return None
+
+    try:
+        client = create_client(supabase_url, supabase_key)
+        return client
+    except Exception as e:
+        st.error(f"❌ Erreur connexion Supabase: {e}")
+        return None
+
+supabase = get_supabase()
+
+if supabase is None:
     st.error("❌ Secrets Supabase manquants!")
     st.info("""
     Vérifiez que vous avez bien configuré les secrets dans Streamlit Cloud:
@@ -71,36 +81,17 @@ if not has_url or not has_key:
     """)
     st.stop()
 
-# ============================================================
-# Connexion Supabase avec gestion d'erreur détaillée
-# ============================================================
-@st.cache_resource
-def get_supabase():
-    try:
-        client = create_client(supabase_url, supabase_key)
-        return client
-    except Exception as e:
-        st.error(f"❌ Erreur connexion Supabase: {e}")
-        return None
-
-supabase = get_supabase()
-
-if supabase is None:
-    st.error("Impossible de se connecter à Supabase")
-    st.stop()
-
 # Test rapide de connexion
 try:
     test_result = supabase.table("sessions").select("count", count="exact").limit(1).execute()
-    st.sidebar.success("✅ Connexion Supabase OK")
 except Exception as e:
-    st.sidebar.error(f"❌ Erreur test connexion: {e}")
-    st.error(f"Erreur de connexion à Supabase: {e}")
+    st.error(f"❌ Erreur test connexion: {e}")
     st.stop()
 
 # ============================================================
 # FONCTIONS DE FETCH
 # ============================================================
+@st.cache_data(ttl=15)  # v4.2: Cache 15s pour réduire les appels
 def fetch_df(table, columns="*", order=None, limit=None, filters=None):
     try:
         query = supabase.table(table).select(columns)
@@ -121,11 +112,6 @@ def fetch_df(table, columns="*", order=None, limit=None, filters=None):
 # UI PRINCIPALE
 # ============================================================
 st.title("🤖 Trading Bot V4 Dashboard")
-
-st.markdown(
-    '<meta http-equiv="refresh" content="30">',
-    unsafe_allow_html=True
-)
 
 # Session actuelle
 sessions = fetch_df("sessions", order="started_at", limit=1)
