@@ -1031,7 +1031,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
 # =============================================================
 class TradeManager:
 
-    def __init__(self, bridge: MT5Bridge, reporter: TradeReporter, tracker=None):
+    def __init__(self, bridge: MT5Bridge, reporter: "TradeReporter", tracker=None):
         self.bridge = bridge
         self.reporter = reporter
         self.tracker = tracker
