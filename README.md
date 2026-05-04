@@ -1,102 +1,60 @@
-# 🤖 Trading Bot V4 — Telegram → MT5 Copy Trading
+# 🖥️ Remote Desktop Protocol
 
-Bot de copy trading qui lit les signaux Telegram et les exécute automatiquement sur MetaTrader 5.
-
----
-
-## 🚀 Fonctionnalités
-
-- **📡 Parser de signaux V5** — Supporte 6 formats de canaux Telegram (BUY/SELL, SMC, DAILY, SL_MOVE, CLOSE...)
-- **⚡ Exécution MT5** — Market orders, limit orders, BE, trailing stop
-- **📊 Dashboard Streamlit** — P&L live, stats par canal, historique des trades
-- **💾 Supabase** — Logging async avec retry exponentiel
-- **🖥️ RDP + Tailscale** — Déploiement automatisé via GitHub Actions
+Access a **Windows 11 Remote Desktop** with **free 4GB/s internet speed** instantly!  
+This project provides a quick and reliable way to connect to a powerful remote environment for development, testing, or personal use. 🚀
 
 ---
 
-## 📁 Structure
+## 📜 Description
 
-```
-├── telegram_listener_v4.py    # Bot principal (Telegram → MT5)
-├── signal_parser.py           # Parser de signaux V5 (6 formats)
-├── supabase_logger.py         # Logger Supabase async
-├── dashboard.py               # Dashboard Streamlit
-├── dashboard-preview.html     # Aperçu statique du dashboard
-├── requirements.txt           # Dépendances Python
-├── .env.example               # Variables d'environnement
-├── .streamlit/config.toml     # Config Streamlit (thème dark)
-├── .github/workflows/         # CI/CD RDP + Tailscale
-├── commande.txt               # Notes de développement
-├── supabase_schema.sql        # Schéma BDD Supabase
-└── HTF_Gold_EA_*.mq5          # Expert Advisor MetaTrader (diverses versions)
-```
+The **Remote Desktop Protocol (RDP)** project allows users to connect to a **Windows 11** virtual machine in the cloud, offering:
+
+- ⚡ **4GB/s Internet Speed**  
+- 💻 **Windows 11 OS**  
+- 🌍 **Free and Easy Remote Access**  
+- 🔒 **Secure and Fast Connection**  
 
 ---
 
-## ⚙️ Installation
+## ⚙️ Setup & Installation
 
-### 1. Cloner le repo
+Getting started is super easy! Just follow the tutorial below:
 
-```bash
-git clone https://github.com/slh04ninja-cmyk/gzl2.git
-cd gzl2
-```
-
-### 2. Installer les dépendances
-
-```bash
-pip install -r requirements.txt
-```
-
-### 3. Configurer les variables d'environnement
-
-```bash
-cp .env.example .env
-# Remplir avec vos vraies valeurs
-```
-
-### 4. Lancer le bot
-
-```bash
-python telegram_listener_v4.py
-```
-
-### 5. Lancer le dashboard
-
-```bash
-streamlit run dashboard.py
-```
+🎥 **Watch the setup video:**  
+👉 [How to Set Up Remote Desktop Protocol (YouTube)](https://youtu.be/bBxejfjInzc)
 
 ---
 
-## 📊 Dashboard
+## 🧰 Features
 
-Le dashboard Streamlit affiche :
-- **Statut** de la session active (running/stopped)
-- **Métriques** : P&L, nombre de trades, win rate, trades ouverts
-- **Performance par canal** avec graphique en barres
-- **Courbe de P&L** cumulée
-- **Historique** des 50 derniers trades
-- **Configuration** de la session
-
-Aperçu statique : ouvrir `dashboard-preview.html` dans un navigateur.
+- 💨 Blazing-fast internet connection  
+- 🪟 Full Windows 11 experience  
+- 🌐 Remote access from any device  
+- 🧩 Simple and lightweight setup  
+- 🔧 No complex configurations needed  
 
 ---
 
-## 🔧 Configuration
+## 🧑‍💻 Usage
 
-| Variable | Description |
-|----------|-------------|
-| `TG_API_ID` | API ID Telegram (my.telegram.org) |
-| `TG_API_HASH` | API Hash Telegram |
-| `SUPABASE_URL` | URL du projet Supabase |
-| `SUPABASE_ANON_KEY` | Clé anon Supabase |
-| `MT5_LOGIN` | Login MetaTrader 5 |
-| `MT5_PASSWORD` | Mot de passe MT5 |
-| `MT5_SERVER` | Serveur du broker |
+1. Follow the video tutorial above.  
+2. Launch your RDP session.  
+3. Enjoy seamless Windows 11 experience with lightning-fast internet.  
 
 ---
+
 
 ## 📄 License
 
-Open-source — utilisez, modifiez et partagez librement.
+This project is open-source — feel free to use, modify, and share it responsibly.  
+
+---
+
+## 💬 Contact
+
+If you have questions, suggestions, or feedback, feel free to open an issue or comment on the YouTube video!  
+📺 [Watch Tutorial on YouTube](https://youtu.be/bBxejfjInzc)
+
+---
+
+⭐ **If you find this project helpful, don’t forget to star the repo!**
