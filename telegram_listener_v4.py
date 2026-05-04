@@ -170,7 +170,7 @@ log.addHandler(console_handler)
 # ------------------------------------------------------------------
 # FILTRE MESSAGES NON-TRADING (importé depuis signal_parser.py)
 # ------------------------------------------------------------------
-# is_spam est importé depuis signal_parser.py via `from signal_parser import SignalParser, is_spam`
+# is_spam et SignalParser sont définis directement dans ce fichier
 
 # ------------------------------------------------------------------
 # GESTION FENÊTRES HORAIRES BLOQUÉES
@@ -368,9 +368,196 @@ class NewsManager:
 
 
 # =============================================================
-# SIGNAL PARSER (V5 — importé depuis signal_parser.py)
+# SIGNAL PARSER V5 — intégré directement (pas d'import externe)
 # =============================================================
-from signal_parser import SignalParser, is_spam
+
+SYMBOL_MAP = {
+    "GOLD": "XAUUSD",
+    "XAU/USD": "XAUUSD",
+    "XAUUSD": "XAUUSD",
+    "SILVER": "XAGUSD",
+    "XAG/USD": "XAGUSD",
+    "XAGUSD": "XAGUSD",
+    "OIL": "USOIL",
+    "USOIL": "USOIL",
+    "BTC": "BTCUSD",
+    "BTC/USD": "BTCUSD",
+    "BITCOIN": "BTCUSD",
+    "BTCUSD": "BTCUSD",
+}
+
+RE_SYMBOL = re.compile(
+    r"(XAU/?USD|GOLD|XAG/?USD|SILVER|USOIL|OIL|BTC/?USD|BITCOIN|BTCUSD)",
+    re.IGNORECASE,
+)
+RE_ACTION = re.compile(r"\b(BUY|SELL)\b", re.IGNORECASE)
+RE_NUM = r"([\d]+(?:\.\d+)?)"
+RE_RANGE = re.compile(rf"{RE_NUM}\s*[-/ ]\s*{RE_NUM}")
+
+EXCLUDE_KEYWORDS_PARSER = [
+    "tp hit", "tp1 hit", "tp2 hit", "tp3 hit", "all tp hit",
+    "mission acomplished", "boom boom boom",
+    "my signal are on fire", "pips profit", "pips gain",
+    "closed at", "exit at", "sl hit", "stopped",
+    "secured", "hit target", "be safe", "good luck",
+    "market update", "analysis",
+    "are you in big loss", "contact",
+    "use proper money management", "consistency",
+]
+SPAM_STANDALONE = ["target", "running"]
+
+
+def is_spam(text: str) -> bool:
+    """Détecte les messages non-trading."""
+    low = text.lower()
+    lines = low.split("\n")
+    for kw in EXCLUDE_KEYWORDS_PARSER:
+        if kw in low:
+            return True
+    for kw in SPAM_STANDALONE:
+        for line in lines:
+            stripped = line.strip().strip("📍🎯📊📈📉❌✅🔴🟢⚪")
+            if stripped == kw or stripped == kw + ":":
+                return True
+    return False
+
+
+def _resolve_symbol(raw: str) -> str:
+    clean = raw.upper().strip().replace(" ", "")
+    return SYMBOL_MAP.get(clean, clean)
+
+
+def _parse_range(text: str) -> tuple[float, float] | None:
+    m = RE_RANGE.search(text)
+    if not m:
+        return None
+    a, b = float(m.group(1)), float(m.group(2))
+    return (min(a, b), max(a, b))
+
+
+def _extract_tps(text: str) -> list[float]:
+    tps = []
+    for m in re.finditer(r"TP\s*\d+\s*[:.]\s*" + RE_NUM, text, re.IGNORECASE):
+        tps.append(float(m.group(1)))
+    if tps:
+        return tps
+    for m in re.finditer(r"TAKE\s+PROFIT\s*[.:]?\s*" + RE_NUM, text, re.IGNORECASE):
+        tps.append(float(m.group(1)))
+    if tps:
+        return tps
+    for m in re.finditer(
+        r"^\s*TP\s+" + RE_NUM + r"(?:\s*[✅☑️✔️🎯]|\s+CONFIRM|\s+HIT)?\s*$",
+        text, re.IGNORECASE | re.MULTILINE
+    ):
+        tps.append(float(m.group(1)))
+    if tps:
+        return tps
+    for m in re.finditer(
+        r"TP\s*[¹²³⁴⁵⁶⁷⁸⁹⁰ⁿ]\s*" + RE_NUM,
+        text, re.IGNORECASE
+    ):
+        tps.append(float(m.group(1)))
+    return tps
+
+
+def _extract_sl(text: str) -> float | None:
+    m = re.search(
+        r"(?:STOP\s*LOSS|Stop\s+Loss)\s*(?:\(\s*SL\s*\))?\s*[.:]?\s*" + RE_NUM,
+        text, re.IGNORECASE
+    )
+    if m:
+        return float(m.group(1))
+    m = re.search(r"SL\s*[_:.]?\s*" + RE_NUM, text, re.IGNORECASE)
+    if m:
+        return float(m.group(1))
+    return None
+
+
+def _extract_symbol(text: str) -> str | None:
+    m = RE_SYMBOL.search(text)
+    return _resolve_symbol(m.group(1)) if m else None
+
+
+def _extract_action(text: str) -> str | None:
+    m = RE_ACTION.search(text)
+    return m.group(1).upper() if m else None
+
+
+def _detect_action_from_tps(zone_low: float, zone_high: float, tps: list[float]) -> str:
+    avg_entry = (zone_low + zone_high) / 2
+    avg_tp = sum(tps) / len(tps)
+    return "BUY" if avg_tp > avg_entry else "SELL"
+
+
+class SignalParser:
+
+    def parse(self, text: str) -> dict | None:
+        if not text or not text.strip():
+            return None
+        if is_spam(text):
+            log.debug(f"[SPAM] {text[:60].replace(chr(10), ' ')}")
+            return None
+        result = self._parse_close(text)
+        if result:
+            return result
+        result = self._parse_sl_move(text)
+        if result:
+            return result
+        result = self._parse_trade(text)
+        if result:
+            return result
+        return None
+
+    def _parse_close(self, text: str) -> dict | None:
+        m = re.search(r"close\s+(all|[A-Z]{3,10})", text, re.IGNORECASE)
+        if not m:
+            return None
+        target = m.group(1).upper()
+        return {"type": "CLOSE", "symbol": None if target == "ALL" else _resolve_symbol(target), "close_all": target == "ALL"}
+
+    def _parse_sl_move(self, text: str) -> dict | None:
+        m = re.search(
+            r"(?:SL\s*MOVE|MOVE\s*SL|New\s*SL|SL\s*→|SL\s*moved?\s*to)"
+            r"\s*[:\s]*\s*" + RE_NUM, text, re.IGNORECASE
+        )
+        if m:
+            return {"type": "SL_MOVE", "new_sl": float(m.group(1))}
+        return None
+
+    def _parse_trade(self, text: str) -> dict | None:
+        symbol = _extract_symbol(text)
+        action = _extract_action(text)
+        tps = _extract_tps(text)
+        sl = _extract_sl(text)
+        zone = _parse_range(text)
+        if not symbol or not tps or sl is None:
+            return None
+        if zone:
+            zone_low, zone_high = zone
+        else:
+            return None
+        if zone_low == zone_high:
+            zone_high = zone_low + 0.5
+            zone_low = zone_low - 0.5
+        zone_mid = round((zone_low + zone_high) / 2, 2)
+        if not action:
+            action = _detect_action_from_tps(zone_low, zone_high, tps)
+        if not self._validate_sl(action, zone_mid, sl):
+            log.warning(f"SL invalide: {action} entry={zone_mid} SL={sl}")
+            return None
+        return {
+            "type": "TRADE", "symbol": symbol, "action": action,
+            "zone_low": zone_low, "zone_mid": zone_mid, "zone_high": zone_high,
+            "tps": tps, "tp1": tps[0], "tp_final": tps[-1], "sl": sl,
+        }
+
+    @staticmethod
+    def _validate_sl(action: str, entry_price: float, sl: float) -> bool:
+        if action == "BUY" and sl >= entry_price:
+            return False
+        if action == "SELL" and sl <= entry_price:
+            return False
+        return True
 
 
 # =============================================================
