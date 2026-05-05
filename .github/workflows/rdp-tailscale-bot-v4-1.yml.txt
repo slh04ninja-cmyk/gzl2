@@ -1,0 +1,695 @@
+# =============================================================
+#  RDP + Tailscale + RustDesk + TradingBot V4
+#  Workflow A — Instance unique ou multi-RDP
+#  AVEC SUPABASE + STREAMLIT DASHBOARD
+# =============================================================
+name: 🤖 TradingBot V4 — RDP + Tailscale + Supabase
+
+on:
+  workflow_dispatch:
+    inputs:
+      # ── Tailscale ──
+      ts_tailnet:
+        description: "Tailscale tailnet (ex: you@gmail.com)"
+        required: true
+      ts_api_key:
+        description: "Tailscale API key"
+        required: true
+      ts_authkey:
+        description: "Tailscale Auth key"
+        required: true
+
+      # ── Runtime ──
+      quick_test:
+        description: "Test rapide (5 min)"
+        type: boolean
+        default: false
+      runtime_minutes:
+        description: "Durée max en minutes (max 360)"
+        required: false
+        default: "355"
+      cycles:
+        description: "0=stop après A; N=handoffs restants"
+        required: false
+        default: "0"
+
+      # ── RDP / CRD ──
+      rdp_count:
+        description: "Instances RDP (1-10)"
+        required: false
+        default: "1"
+      crd_code:
+        description: "Chrome Remote Desktop code (optionnel)"
+        required: false
+        default: ""
+      # ── Bot Repo ──
+      bot_repo:
+        description: "Repo GitHub (ex: user/repo)"
+        required: true
+        default: ""
+
+      # ── Telegram ──
+      tg_api_id:
+        description: "Telegram API ID (my.telegram.org)"
+        required: true
+        default: ""
+      tg_api_hash:
+        description: "Telegram API Hash"
+        required: true
+        default: ""
+      tg_channels:
+        description: "Canaux Telegram séparés par virgules (ex: @Canal1,@Canal2,@Canal3,@Canal4)"
+        required: true
+        default: ""
+      tg_report_channel:
+        description: "Canal de rapport Telegram (alertes + récap)"
+        required: false
+        default: ""
+
+      # ── MetaTrader 5 ──
+      mt5_login:
+        description: "MT5 Login (numéro de compte)"
+        required: true
+        default: ""
+      mt5_password:
+        description: "MT5 Password"
+        required: true
+        default: ""
+      mt5_server:
+        description: "MT5 Server (ex: Exness-MT5Real16)"
+        required: true
+        default: ""
+
+      # ── Trading ──
+      lot_total:
+        description: "Lot total par signal (ex: 0.02)"
+        required: false
+        default: "0.02"
+      trail_points:
+        description: "Trail points XAUUSDm Exness (150 = $1.50)"
+        required: false
+        default: "150"
+      demo_mode:
+        description: "Demo Mode — true=demo, false=live"
+        required: false
+        default: "true"
+
+      # ── Filtres ──
+      news_filter_enabled:
+        description: "Filtre News Forex Factory (true/false)"
+        required: false
+        default: "true"
+      news_windows:
+        description: "Minutes news séparées par virgules: avant_bloc,avant_fermeture,après (ex: 15,5,15)"
+        required: false
+        default: "15,5,15"
+
+      # ── Supabase / Dashboard ──
+      supabase_url:
+        description: "Supabase URL (ex: https://xxx.supabase.co)"
+        required: false
+        default: ""
+      supabase_anon_key:
+        description: "Supabase Anon Key"
+        required: false
+        default: ""
+      risk_params:
+        description: "Limites risque: MAX_POSITIONS,MAX_SPREAD_POINTS (ex: 6,50)"
+        required: false
+        default: "6,50"
+
+permissions:
+  contents: read
+  actions: write
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  # =============================================================
+  #  JOB 1 : Setup — calcul de la matrice
+  # =============================================================
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+      multi: ${{ steps.mk.outputs.multi }}
+    steps:
+      - id: mk
+        run: |
+          $crd = @'
+          ${{ inputs.crd_code }}
+          '@.Trim()
+          if ($crd.Length -gt 0) { $n = 1 } else {
+            $n = [int]"${{ inputs.rdp_count }}"
+            if ($n -lt 1) { $n = 1 }
+            if ($n -gt 10) { $n = 10 }
+          }
+          $inc = @()
+          for ($i = 1; $i -le $n; $i++) { $inc += @{ id = $i } }
+          $json = @{ include = $inc } | ConvertTo-Json -Compress
+          "matrix=$json" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $multi = if ($n -gt 1) { '1' } else { '0' }
+          "multi=$multi" | Out-File $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+  # =============================================================
+  #  JOB 2 : RDP — instance Windows + Bot Trading V4
+  # =============================================================
+  rdp:
+    needs: setup
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+      max-parallel: 10
+    timeout-minutes: 370
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
+
+    steps:
+      # ── CRD Flag ──
+      - name: Set CRD flag
+        run: |
+          $crd = @'
+          ${{ inputs.crd_code }}
+          '@.Trim()
+          if ($crd.Length -gt 0) {
+            "CRD_ENABLED=1" | Out-File -Append $env:GITHUB_ENV
+          } else {
+            "CRD_ENABLED=0" | Out-File -Append $env:GITHUB_ENV
+          }
+
+      # ── Chrome Remote Desktop ──
+      - name: Install Chrome Remote Desktop
+        if: env.CRD_ENABLED == '1'
+        run: |
+          $exe = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if (-not (Test-Path $exe)) {
+            $exePath = "$env:TEMP\chromeremotedesktophost.exe"
+            try {
+              Invoke-WebRequest -Uri "https://dl.google.com/support/remote_assistance/ChromotingHostSetup.exe" -OutFile $exePath -ErrorAction Stop
+              Start-Process -FilePath $exePath -ArgumentList "/silent", "/install" -Wait
+              Remove-Item $exePath -Force
+            } catch {
+              $msi = "$env:TEMP\chromeremotedesktophost.msi"
+              Invoke-WebRequest -Uri "https://dl.google.com/edgedl/chrome-remote-desktop/chromeremotedesktophost.msi" -OutFile $msi -ErrorAction Stop
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$msi`"", "/quiet", "/norestart" -Wait
+              Remove-Item $msi -Force
+            }
+          }
+
+      - name: Run Chrome Remote Desktop
+        if: env.CRD_ENABLED == '1'
+        run: |
+          $raw = @'
+          ${{ inputs.crd_code }}
+          '@.Trim()
+          $pin = "123456".Trim()
+          $starter = "${Env:PROGRAMFILES(X86)}\Google\Chrome Remote Desktop\CurrentVersion\remoting_start_host.exe"
+          if ($raw -match '--code\s*=\s*"?([^"\s]+)') {
+            $code = ([regex]::Match($raw, '--code\s*=\s*"?([^"\s]+)')).Groups[1].Value
+          } elseif ($raw -match '^4\/') {
+            $code = $raw
+          }
+          if ($code) {
+            Start-Process -FilePath $starter -ArgumentList @(
+              "--code="$code"",
+              "--redirect-url="https://remotedesktop.google.com/_/oauthredirect"",
+              "--name="$Env:COMPUTERNAME"",
+              "--pin="$pin""
+            )
+          }
+
+      # ── Hostname + Runtime ──
+      - name: Decide hostname + runtime
+        run: |
+          if ("${{ inputs.rdp_count }}" -gt 1) {
+            $hn = "bullet${{ matrix.id }}"
+          } else {
+            $hn = "bullet"
+          }
+          "TS_HOSTNAME=$hn" | Out-File -Append $env:GITHUB_ENV
+
+          function Yes($v) { "$v" -match '^(?i:true|1|yes|on)$' }
+          if ("${{ inputs.runtime_minutes }}" -match '^\d+$') {
+            $runtime = [int]"${{ inputs.runtime_minutes }}"
+          } else {
+            $runtime = 355
+          }
+          if (Yes("${{ inputs.quick_test }}")) { $runtime = 5 }
+          if (-not (Yes("${{ inputs.quick_test }}")) -and $runtime -lt 6) { $runtime = 355 }
+          if ($runtime -gt 360) { $runtime = 355 }
+          "RUNTIME_MINUTES=$runtime" | Out-File -Append $env:GITHUB_ENV
+
+      # ── Purge Tailscale ──
+      - name: Purge bullet* devices
+        if: needs.setup.outputs.multi == '0'
+        run: |
+          function Yes($v) { "$v" -match '^(?i:true|1|yes|on)$' }
+          if ($true) {
+            try {
+              $auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${{ inputs.ts_api_key }}:"))
+              $tn = [uri]::EscapeDataString("${{ inputs.ts_tailnet }}")
+              $list = Invoke-RestMethod -Uri "https://api.tailscale.com/api/v2/tailnet/$tn/devices" -Headers @{ Authorization = "Basic $auth" }
+              foreach ($d in $list.devices) {
+                if ($d.hostname -match '^bullet[0-9]*$') {
+                  Invoke-RestMethod -Method Delete -Uri "https://api.tailscale.com/api/v2/device/$($d.id)" -Headers @{ Authorization = "Basic $auth" } -EA SilentlyContinue
+                }
+              }
+              Write-Host "Purge terminée."
+            } catch {
+              Write-Host "Purge warning: $($_.Exception.Message)"
+            }
+          }
+
+      # ── Tailscale ──
+      - name: Install + Up Tailscale
+        run: |
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $ts)) {
+            $dst = "$env:TEMP\tailscale.msi"
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi" -OutFile $dst
+            Start-Process msiexec.exe -ArgumentList "/i", "`"$dst`"", "/quiet", "/norestart" -Wait
+            Remove-Item $dst -Force
+          }
+          & $ts logout | Out-Null
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "$env:TS_HOSTNAME" --accept-dns=true --accept-routes=true
+          $ip4 = & $ts ip -4 | Select-Object -First 1
+          "TAILSCALE_IP=$ip4" | Out-File -Append $env:GITHUB_ENV
+          Write-Host "Tailscale IPv4: $ip4"
+
+      # ── RDP User + Firewall ──
+      - name: Enable RDP user + firewall
+        run: |
+          $u = $env:RDP_USER
+          $p = $env:RDP_PASS
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          if (-not (Get-LocalUser -Name $u -EA SilentlyContinue)) {
+            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Add-LocalGroupMember -Group "Administrators" -Member $u
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+          } else {
+            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
+            Enable-LocalUser -Name $u
+            Add-LocalGroupMember -Group "Administrators" -Member $u -EA SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
+          }
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Write-Host "RDP prêt. user=$u | ip=$env:TAILSCALE_IP"
+
+      # ── Python ──
+      - name: Install Python 3.11
+        run: |
+          $pyCmd = Get-Command python -ErrorAction SilentlyContinue
+          if ($pyCmd) {
+            $ver = & python --version 2>&1
+            Write-Host "Python déjà présent : $ver"
+          } else {
+            Write-Host "Python non trouvé — installation..."
+            $pyUrl = "https://www.python.org/ftp/python/3.11.9/python-3.11.9-amd64.exe"
+            $pyInst = "$env:TEMP\python-installer.exe"
+            Invoke-WebRequest -Uri $pyUrl -OutFile $pyInst
+            Start-Process -FilePath $pyInst -ArgumentList @(
+              "/quiet", "InstallAllUsers=1", "PrependPath=1",
+              "Include_test=0", "Include_doc=0"
+            ) -Wait
+            Remove-Item $pyInst -Force
+            Write-Host "Python installé."
+          }
+          $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+          $userPath = [System.Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path = "$machinePath;$userPath"
+          $pyPaths = @(
+            "C:\Python311", "C:\Python311\Scripts",
+            "C:\Program Files\Python311", "C:\Program Files\Python311\Scripts",
+            "$env:LOCALAPPDATA\Programs\Python\Python311",
+            "$env:LOCALAPPDATA\Programs\Python\Python311\Scripts"
+          )
+          foreach ($p in $pyPaths) {
+            if (Test-Path "$p\python.exe") {
+              Write-Host "Python trouvé dans : $p"
+              $current = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+              if ($current -notlike "*$p*") {
+                [System.Environment]::SetEnvironmentVariable("Path", "$current;$p;$p\Scripts", "Machine")
+                Write-Host "PATH mis à jour avec $p"
+              }
+              $env:Path = "$env:Path;$p;$p\Scripts"
+              break
+            }
+          }
+          $ver = & python --version 2>&1
+          Write-Host "Version finale : $ver"
+          "PYTHON_OK=1" | Out-File -Append $env:GITHUB_ENV
+
+      # ── Python Libs ──
+      - name: Install Python libs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_REPO: ${{ inputs.bot_repo }}
+        run: |
+          $machinePath = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+          $userPath    = [System.Environment]::GetEnvironmentVariable("Path", "User")
+          $env:Path    = "$machinePath;$userPath"
+          python -m pip install --upgrade pip -q
+
+          # ── Dépendances du BOT (toujours requises) ──
+          Write-Host "Installation des dépendances du bot..."
+          python -m pip install telethon MetaTrader5 python-dotenv -q
+
+          # ── Dépendances du DASHBOARD (depuis requirements.txt si dispo) ──
+          $repo     = $env:BOT_REPO
+          $headers  = @{ 
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github.v3.raw"
+          }
+          $apiBase   = "https://api.github.com/repos/$repo/contents"
+          $reqFile   = "$env:TEMP\requirements.txt"
+          try {
+            Invoke-WebRequest -Uri "$apiBase/requirements.txt" -OutFile $reqFile -Headers $headers -ErrorAction Stop
+            Write-Host "requirements.txt téléchargé — installation des deps dashboard..."
+            python -m pip install -r $reqFile -q
+          } catch {
+            Write-Host "requirements.txt non trouvé — installation des deps dashboard par défaut..."
+            python -m pip install supabase streamlit plotly pandas streamlit-autorefresh -q
+          }
+          python -c "import telethon, MetaTrader5, dotenv; print('Bot deps OK')"
+          python -c "import supabase; print('Supabase OK')"
+
+      # ── RustDesk ──
+      - name: Install RustDesk
+        run: |
+          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
+          if (-not (Test-Path $rdExe)) {
+            try {
+              $dst = "$env:TEMP\rustdesk.msi"
+              Invoke-WebRequest -Uri "https://github.com/rustdesk/rustdesk/releases/download/1.3.1/rustdesk-1.3.1-x86_64.msi" -OutFile $dst
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$dst`"", "/quiet", "/norestart" -Wait
+              Remove-Item $dst -Force
+            } catch {
+              winget install --id RustDesk.RustDesk -e --silent --accept-package-agreements --accept-source-agreements --disable-interactivity
+            }
+          }
+          Start-Process -FilePath $rdExe -EA SilentlyContinue
+          Start-Sleep -Seconds 5
+
+      # ── MT5 Exness (téléchargement sur Bureau, install manuelle) ──
+      - name: Download MT5 Exness
+        run: |
+          $mt5Url = "https://download.terminal.free/cdn/web/exness.technologies.ltd/mt5/exness5setup.exe"
+          $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+          $dest = "$desktop\exness5setup.exe"
+          Write-Host "Téléchargement MT5 Exness sur le Bureau..."
+          Invoke-WebRequest -Uri $mt5Url -OutFile $dest -TimeoutSec 120 -ErrorAction Stop
+          $size = [math]::Round((Get-Item $dest).Length / 1MB, 1)
+          Write-Host "MT5 téléchargé: $dest ($size MB) [OK]"
+
+      # ── Setup TradingBot V4 ──
+      - name: Setup TradingBot V4
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BOT_REPO: ${{ inputs.bot_repo }}
+          TG_API_ID: ${{ inputs.tg_api_id }}
+          TG_API_HASH: ${{ inputs.tg_api_hash }}
+          TG_CHANNELS: ${{ inputs.tg_channels }}
+          TG_REPORT_CHANNEL: ${{ inputs.tg_report_channel }}
+          MT5_LOGIN: ${{ inputs.mt5_login }}
+          MT5_PASSWORD: ${{ inputs.mt5_password }}
+          MT5_SERVER: ${{ inputs.mt5_server }}
+          LOT_TOTAL: ${{ inputs.lot_total }}
+          TRAIL_POINTS: ${{ inputs.trail_points }}
+          DEMO_MODE: ${{ inputs.demo_mode }}
+          NEWS_FILTER_ENABLED: ${{ inputs.news_filter_enabled }}
+          NEWS_WINDOWS: ${{ inputs.news_windows }}
+          SUPABASE_URL: ${{ inputs.supabase_url }}
+          SUPABASE_ANON_KEY: ${{ inputs.supabase_anon_key }}
+          RISK_PARAMS: ${{ inputs.risk_params }}
+        run: |
+          # ── Créer le dossier ──
+          $botDir = "C:\TradingBot"
+          if (-not (Test-Path $botDir)) {
+            New-Item -ItemType Directory -Path $botDir | Out-Null
+          }
+
+          # ── Télécharger le bot V4 depuis GitHub (API Contents pour repos privés) ──
+          $repo = $env:BOT_REPO
+          $headers = @{ 
+            Authorization = "Bearer $env:GH_TOKEN"
+            Accept = "application/vnd.github.v3.raw"
+          }
+          $apiBase = "https://api.github.com/repos/$repo/contents"
+
+          # ── Télécharger tous les fichiers du bot ──
+          $botFiles = @(
+            "telegram_listener_v4.py",
+            "signal_parser.py",
+            "supabase_logger.py",
+            "dashboard.py",
+            "requirements.txt"
+          )
+          foreach ($file in $botFiles) {
+            try {
+              $url = "$apiBase/$file"
+              Invoke-WebRequest -Uri $url -OutFile "$botDir\$file" -Headers $headers -ErrorAction Stop
+              Write-Host "$file téléchargé [OK]"
+            } catch {
+              Write-Warning "Impossible de télécharger $file : $($_.Exception.Message)"
+              if ($file -in @("telegram_listener_v4.py", "signal_parser.py")) {
+                Write-Error "FICHIER CRITIQUE MANQUANT: $file — le bot ne peut pas démarrer!"
+              }
+            }
+          }
+
+          # ── Créer le fichier .env ──
+          $envFile = "$botDir\.env"
+
+          # ── Parser les channels (séparés par virgules) ──
+          $channels = $env:TG_CHANNELS -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ -ne '' }
+          $ch1 = if ($channels.Count -ge 1) { $channels[0] } else { "" }
+          $ch2 = if ($channels.Count -ge 2) { $channels[1] } else { "" }
+          $ch3 = if ($channels.Count -ge 3) { $channels[2] } else { "" }
+          $ch4 = if ($channels.Count -ge 4) { $channels[3] } else { "" }
+
+          # ── Parser les news windows (format: avant_bloc,avant_fermeture,après) ──
+          $nw = $env:NEWS_WINDOWS -split ',' | ForEach-Object { $_.Trim() }
+          $nwBeforeBlock  = if ($nw.Count -ge 1) { $nw[0] } else { "15" }
+          $nwBeforeClose  = if ($nw.Count -ge 2) { $nw[1] } else { "5" }
+          $nwAfter        = if ($nw.Count -ge 3) { $nw[2] } else { "15" }
+
+          # ── Parser les risk_params (format: MAX_POSITIONS,MAX_SPREAD_POINTS) ──
+          $rp = $env:RISK_PARAMS -split ',' | ForEach-Object { $_.Trim() }
+          $maxPositions   = if ($rp.Count -ge 1 -and $rp[0] -match '^\d+$') { $rp[0] } else { "6" }
+          $maxSpread      = if ($rp.Count -ge 2 -and $rp[1] -match '^\d+$') { $rp[1] } else { "50" }
+
+          $lines = @(
+            "TG_API_ID=$env:TG_API_ID",
+            "TG_API_HASH=$env:TG_API_HASH",
+            "TG_CHANNEL=$ch1",
+            "TG_CHANNEL_2=$ch2",
+            "TG_CHANNEL_3=$ch3",
+            "TG_CHANNEL_4=$ch4",
+            "TG_REPORT_CHANNEL=$env:TG_REPORT_CHANNEL",
+            "MT5_LOGIN=$env:MT5_LOGIN",
+            "MT5_PASSWORD=$env:MT5_PASSWORD",
+            "MT5_SERVER=$env:MT5_SERVER",
+            "LOT_TOTAL=$env:LOT_TOTAL",
+            "ORDER_EXPIRY_MINUTES=240",
+            "SLIPPAGE=20",
+            "MAGIC_NUMBER=20250226",
+            "TRAIL_POINTS=$env:TRAIL_POINTS",
+            "DEMO_MODE=$env:DEMO_MODE",
+            "NEWS_FILTER_ENABLED=$env:NEWS_FILTER_ENABLED",
+            "NEWS_WINDOW_BEFORE_BLOCK=$nwBeforeBlock",
+            "NEWS_WINDOW_BEFORE_CLOSE=$nwBeforeClose",
+            "NEWS_WINDOW_AFTER=$nwAfter",
+            "TIME_FILTER_ENABLED=false",
+            "TIME_BLOCKED_WINDOWS=",
+            "RUNTIME_MINUTES=$env:RUNTIME_MINUTES",
+            "SUPABASE_URL=$env:SUPABASE_URL",
+            "SUPABASE_ANON_KEY=$env:SUPABASE_ANON_KEY",
+            "MAX_POSITIONS=$maxPositions",
+            "MAX_SPREAD_POINTS=$maxSpread"
+          )
+          $lines | Set-Content -Path $envFile -Encoding UTF8
+          Write-Host "Fichier .env créé"
+
+          # ── Raccourci Bureau ──
+          $desktop = [Environment]::GetFolderPath("CommonDesktopDirectory")
+          $wsh = New-Object -ComObject WScript.Shell
+          $lnk = $wsh.CreateShortcut("$desktop\Lancer Bot Trading V4.lnk")
+          $lnk.TargetPath = "powershell.exe"
+          $lnk.Arguments = "-NoExit -ExecutionPolicy Bypass -Command `"cd C:\TradingBot; python telegram_listener_v4.py`""
+          $lnk.WorkingDirectory = $botDir
+          $lnk.IconLocation = "powershell.exe"
+          $lnk.Save()
+
+          # ── Résumé ──
+          Write-Host "========================================"
+          Write-Host " TRADINGBOT V4 — PRÊT"
+          Write-Host "========================================"
+          Write-Host " IP RDP     : $env:TAILSCALE_IP"
+          Write-Host " User RDP   : Bullettemporary"
+          Write-Host " Canaux     : $env:TG_CHANNELS"
+          if ($env:TG_REPORT_CHANNEL) { Write-Host " Rapport    : $env:TG_REPORT_CHANNEL" }
+          Write-Host " MT5        : $env:MT5_SERVER"
+          Write-Host " Lot        : $env:LOT_TOTAL"
+          Write-Host " Trail      : $env:TRAIL_POINTS pts"
+          Write-Host " Demo Mode  : $env:DEMO_MODE"
+          if ($env:SUPABASE_URL) { Write-Host " Supabase   : CONNECTÉ" }
+          Write-Host "========================================"
+          Write-Host " Sur le Bureau : double-cliquez"
+          Write-Host " 'Lancer Bot Trading V4'"
+          Write-Host "========================================"
+
+      # ── Vérification avant démarrage ──
+      - name: Verify bot files
+        run: |
+          $botDir = "C:\TradingBot"
+          $required = @("telegram_listener_v4.py", "signal_parser.py", "supabase_logger.py", ".env")
+          $ok = $true
+          foreach ($f in $required) {
+            $path = Join-Path $botDir $f
+            if (Test-Path $path) {
+              $size = (Get-Item $path).Length
+              Write-Host "[OK] $f ($size bytes)"
+            } else {
+              Write-Error "[MISSING] MANQUANT: $f"
+              $ok = $false
+            }
+          }
+          if (-not $ok) {
+            Write-Error "Fichiers critiques manquants — le bot va crasher!"
+            exit 1
+          }
+          # Test import rapide
+          python -c "import sys; sys.path.insert(0, '$botDir'); from signal_parser import SignalParser; print('Import signal_parser OK')"
+
+      # ── Start Bot (seulement si MT5 est installé) ──
+      - name: Start TradingBot V4
+        if: false  # ── DÉSACTIVÉ ──
+        run: |
+          $botDir = "C:\TradingBot"
+
+          # Vérifier si MT5 est installé
+          $mt5Exe = $null
+          $searchPaths = @(
+            "${Env:PROGRAMFILES}\MetaTrader 5\terminal64.exe",
+            "${Env:PROGRAMFILES(x86)}\MetaTrader 5\terminal64.exe"
+          )
+          foreach ($p in $searchPaths) {
+            if (Test-Path $p) { $mt5Exe = $p; break }
+          }
+          if (-not $mt5Exe) {
+            $found = Get-ChildItem -Path "C:\" -Filter "terminal64.exe" -Recurse -Depth 4 -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $mt5Exe = $found.FullName }
+          }
+
+          if (-not $mt5Exe) {
+            Write-Host "========================================"
+            Write-Host " MT5 NON INSTALLÉ"
+            Write-Host "========================================"
+            Write-Host "Le setup MT5 est sur le Bureau."
+            Write-Host "1. Connectez-vous en RDP"
+            Write-Host "2. Double-cliquez 'exness5setup.exe'"
+            Write-Host "3. Installez MT5"
+            Write-Host "4. Double-cliquez 'Lancer Bot Trading V4'"
+            Write-Host "========================================"
+            exit 0
+          }
+
+          Write-Host "MT5 trouvé: $mt5Exe"
+          Write-Host "Demarrage du bot en arriere-plan..."
+          Start-Process -FilePath "python" -ArgumentList "telegram_listener_v4.py" -WorkingDirectory $botDir -RedirectStandardOutput "$botDir\bot_stdout.log" -RedirectStandardError "$botDir\bot_stderr.log" -NoNewWindow
+          Start-Sleep -Seconds 5
+          if (Test-Path "$botDir\bot_stdout.log") {
+            $size = (Get-Item "$botDir\bot_stdout.log").Length
+            Write-Host "Bot demarre [OK] — log: $size bytes"
+          }
+          if (Test-Path "$botDir\bot_stderr.log") {
+            $errSize = (Get-Item "$botDir\bot_stderr.log").Length
+            if ($errSize -gt 0) {
+              Write-Host "ATTENTION — stderr ($errSize bytes):"
+              Get-Content "$botDir\bot_stderr.log" -Tail 20
+            }
+          }
+
+      # ── Keep Alive ──
+      - name: Keep alive
+        run: |
+          $mins = [int]"$env:RUNTIME_MINUTES"
+          $end = (Get-Date).AddMinutes($mins)
+          while ((Get-Date) -lt $end) {
+            Write-Host ("Heartbeat " + (Get-Date).ToString("HH:mm:ss") + " | ends " + $end.ToString("HH:mm:ss") + " | ip=$env:TAILSCALE_IP")
+            Start-Sleep -Seconds 60
+          }
+
+# ── Cleanup sécurité: supprimer le fichier .env ──
+      - name: Cleanup .env
+        if: always()
+        run: |
+          $envFile = "C:\TradingBot\.env"
+          if (Test-Path $envFile) {
+            Remove-Item $envFile -Force
+            Write-Host "Fichier .env supprimé (cleanup sécurité)"
+          }
+      # ── Dispatch next or stop ──
+      - name: Dispatch next or stop
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $cycles = [int]"${{ inputs.cycles }}"
+          if ($cycles -gt 0) {
+            $next = $cycles - 1
+            if ($next -le 0) {
+              $url = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-stop.yml/dispatches"
+              $hdr = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $body = @{
+                ref = "${{ github.ref_name }}"
+                inputs = @{
+                  ts_tailnet = "${{ inputs.ts_tailnet }}"
+                  ts_api_key = "${{ inputs.ts_api_key }}"
+                  base_prefix = "bullet"
+                  max_count = "10"
+                  dry_run = "false"
+                }
+              } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url -Headers $hdr -Body $body | Out-Null
+              Write-Host "Dispatched STOP."
+            } else {
+              $payload = @{
+                ts_tailnet = "${{ inputs.ts_tailnet }}"
+                ts_api_key = "${{ inputs.ts_api_key }}"
+                ts_authkey = "${{ inputs.ts_authkey }}"
+                quick_test = "${{ inputs.quick_test }}"
+                runtime_minutes = "${{ inputs.runtime_minutes }}"
+                cycles = "$next"
+                rdp_count = "${{ inputs.rdp_count }}"
+                crd_code = "${{ inputs.crd_code }}"
+                bot_repo = "${{ inputs.bot_repo }}"
+                tg_api_id = "${{ inputs.tg_api_id }}"
+                tg_api_hash = "${{ inputs.tg_api_hash }}"
+                tg_channels = "${{ inputs.tg_channels }}"
+                tg_report_channel = "${{ inputs.tg_report_channel }}"
+                mt5_login = "${{ inputs.mt5_login }}"
+                mt5_password = "${{ inputs.mt5_password }}"
+                mt5_server = "${{ inputs.mt5_server }}"
+                lot_total = "${{ inputs.lot_total }}"
+                trail_points = "${{ inputs.trail_points }}"
+                demo_mode = "${{ inputs.demo_mode }}"
+                news_filter_enabled = "${{ inputs.news_filter_enabled }}"
+                news_windows = "${{ inputs.news_windows }}"
+                supabase_url = "${{ inputs.supabase_url }}"
+                supabase_anon_key = "${{ inputs.supabase_anon_key }}"
+                risk_params = "${{ inputs.risk_params }}"
+              }
+              $url2 = "https://api.github.com/repos/${{ github.repository }}/actions/workflows/rdp-tailscale-rustdesk-B.yml/dispatches"
+              $hdr2 = @{ Authorization = "Bearer $env:GH_TOKEN"; Accept = "application/vnd.github+json" }
+              $body2 = @{ ref = "${{ github.ref_name }}"; inputs = $payload } | ConvertTo-Json -Depth 20
+              Invoke-WebRequest -Method POST -Uri $url2 -Headers $hdr2 -Body $body2 | Out-Null
+              Write-Host "Dispatched Workflow B cycles=$next"
+            }
+          } else {
+            Write-Host "Pas de cycle configuré. Terminé."
+          }
