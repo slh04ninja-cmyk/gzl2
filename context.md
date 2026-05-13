@@ -1,6 +1,7 @@
 # Context.md — TradingBot GZL2
 
 > **Dernière mise à jour :** 2026-05-14
+> **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
 Bot de copy trading Telegram → MetaTrader 5 (Exness). Écoute des canaux Telegram de signaux trading gold, parse les signaux en temps réel et exécute les ordres automatiquement sur MT5.
