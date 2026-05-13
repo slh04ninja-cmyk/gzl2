@@ -73,6 +73,10 @@ on:
         default: ""
 
       # ── Trading ──
+      tp_trigger:
+        description: "TP déclencheur BE/trailing (défaut: 3)"
+        required: false
+        default: "3"
       demo_mode:
         description: "Demo Mode — true=demo, false=live"
         required: false
@@ -379,6 +383,7 @@ jobs:
           MT5_LOGIN: ${{ inputs.mt5_login }}
           MT5_PASSWORD: ${{ inputs.mt5_password }}
           MT5_SERVER: ${{ inputs.mt5_server }}
+          TP_TRIGGER: ${{ inputs.tp_trigger }}
           DEMO_MODE: ${{ inputs.demo_mode }}
         run: |
           # ── Créer le dossier ──
@@ -434,6 +439,7 @@ jobs:
             "MT5_PASSWORD=$env:MT5_PASSWORD",
             "MT5_SERVER=$env:MT5_SERVER",
             "MT5_PATH=$env:MT5_PATH",
+            "TP_TRIGGER=$env:TP_TRIGGER",
             "DEMO_MODE=$env:DEMO_MODE",
             "RUNTIME_MINUTES=$env:RUNTIME_MINUTES"
           )
