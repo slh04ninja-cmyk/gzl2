@@ -1,7 +1,7 @@
 """
 =============================================================
  TELEGRAM → MT5 | Bot Trading
- Version 4.3.2 — diagnostic logs + TradeReporter fix
+ Version 4.4.0 — multi-channel + no TG reports
 =============================================================
  Changements v4.3.2 (2026-05-05) :
  - FIX: TradeReporter forward reference (type hint string)
@@ -33,7 +33,6 @@ import logging
 import time
 import json
 import urllib.request
-import signal
 import os
 import threading  # FIX: thread-safe lock pour to_thread
 from datetime import datetime, timedelta, timezone
@@ -62,11 +61,12 @@ _supa_connected = False
 # ------------------------------------------------------------------
 API_ID = int(os.getenv("TG_API_ID", "0"))
 API_HASH = os.getenv("TG_API_HASH", "")
-CHANNEL_NAME = os.getenv("TG_CHANNEL", "")
+CHANNEL_NAME = os.getenv("TG_CHANNEL_1", os.getenv("TG_CHANNEL", ""))
 CHANNEL_NAME_2 = os.getenv("TG_CHANNEL_2", "")
 CHANNEL_NAME_3 = os.getenv("TG_CHANNEL_3", "")
 CHANNEL_NAME_4 = os.getenv("TG_CHANNEL_4", "")
-REPORT_CHANNEL = os.getenv("TG_REPORT_CHANNEL", "")
+CHANNEL_NAME_5 = os.getenv("TG_CHANNEL_5", "")
+CHANNEL_NAME_6 = os.getenv("TG_CHANNEL_6", "")
 
 MT5_LOGIN = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
@@ -101,7 +101,6 @@ SHUTDOWN_MARGIN_MIN = 5
 
 START_TIME = datetime.now(timezone.utc)
 _shutdown_event = asyncio.Event()
-_report_event = asyncio.Event()
 
 
 def _parse_blocked_windows(raw: str) -> list:
@@ -253,13 +252,14 @@ class PerformanceTracker:
         ]
         return "\n".join(lines)
 
-    async def send_final_report(self, reporter):
+    def print_final_report(self):
         if self._report_sent:
             return
         self._report_sent = True
-        log.info("[PERF] Envoi du rapport final...")
+        log.info("[PERF] Rapport final:")
         summary = self.format_session_summary()
-        await reporter.send_tg(summary)
+        for line in summary.split("\n"):
+            log.info(line)
 
 
 # =============================================================
@@ -1220,9 +1220,8 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
 # =============================================================
 class TradeManager:
 
-    def __init__(self, bridge: MT5Bridge, reporter: "TradeReporter", tracker=None):
+    def __init__(self, bridge: MT5Bridge, tracker=None):
         self.bridge = bridge
-        self.reporter = reporter
         self.tracker = tracker
         self.active = []
         self._lock = threading.Lock()  # FIX: thread-safe (to_thread) au lieu de asyncio.Lock
@@ -1294,11 +1293,7 @@ class TradeManager:
                     return positions[0]
         return None
 
-    def _schedule_report(self, coro):
-        if self.reporter._loop:
-            asyncio.run_coroutine_threadsafe(coro, self.reporter._loop)
-        else:
-            log.warning("Reporter non initialisé, rapport ignoré")
+
 
     def _check_all(self):
         now = datetime.now(timezone.utc)
@@ -1370,25 +1365,11 @@ class TradeManager:
                     tp_val = t.get("tp_target", 0)
                     tp_indices_closed.add(tp_idx)
                     if pnl >= 0:
-                        self._schedule_report(
-                            self.reporter.on_tp_reached(
-                                t["ticket"],
-                                sig,
-                                f"TP{tp_idx+1}",
-                                tp_val,
-                                pnl,
-                            )
-                        )
                         if _supa_connected and _supa:
                             supa_id = entry.get("_supa_trade_id")
                             if supa_id:
                                 _supa.log_tp_hit(supa_id, f"TP{tp_idx+1}", tp_val, pnl)
                     else:
-                        self._schedule_report(
-                            self.reporter.on_sl_hit(
-                                t["ticket"], sig, pnl
-                            )
-                        )
                         if _supa_connected and _supa:
                             supa_id = entry.get("_supa_trade_id")
                             if supa_id:
@@ -1666,9 +1647,6 @@ class TradeManager:
                     f"Trade terminé ({symbol}) | Canal: {canal} "
                     f"| P&L total: {total_pnl:+.2f}"
                 )
-                self._schedule_report(
-                    self.reporter.on_trade_closed(entry, total_pnl)
-                )
                 if hasattr(self, "tracker") and self.tracker:
                     self.tracker.log_trade_close(entry, total_pnl)
                 if _supa_connected and _supa:
@@ -1688,156 +1666,7 @@ class TradeManager:
                         self.active.remove(entry)
 
 
-# =============================================================
-# TRADE REPORTER
-# =============================================================
-class TradeReporter:
 
-    def __init__(self):
-        self._tg_client = None
-        self._report_entity = None
-        self._loop = None
-
-    async def set_telegram_client(self, client: TelegramClient):
-        self._tg_client = client
-        self._loop = asyncio.get_running_loop()
-        if REPORT_CHANNEL:
-            try:
-                self._report_entity = await client.get_entity(REPORT_CHANNEL)
-                log.info(
-                    f"Canal de rapport : "
-                    f"{getattr(self._report_entity, 'title', REPORT_CHANNEL)}"
-                )
-            except Exception as e:
-                log.warning(f"Canal de rapport introuvable : {e}")
-                self._report_entity = None
-
-    async def send_tg(self, message: str):
-        if self._tg_client and self._report_entity:
-            try:
-                await self._tg_client.send_message(
-                    self._report_entity, message
-                )
-            except Exception as e:
-                log.error(f"Erreur envoi rapport TG : {e}")
-
-    async def on_order_opened(self, entry):
-        sig = entry["signal"]
-        canal = sig.get("source_channel", "Inconnu")
-        zone = f"{sig['zone_low']}-{sig['zone_high']}"
-        all_tps = sig["tps"]
-        tps_str = ", ".join([f"TP{i + 1}={v}" for i, v in enumerate(all_tps)])
-
-        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
-        msg = (
-            f"🟢 ORDRE OUVERT {mode_tag}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"📍 Zone : {zone}\n"
-            f"❌ SL : {sig['sl']}\n"
-            f"🎯 {tps_str}\n"
-            f"📦 Lot : {LOT_SIZE} × {len(entry['tickets'])} position(s)\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
-
-    async def on_tp_reached(self, ticket, sig, tp_name, tp_value, pnl):
-        canal = sig.get("source_channel", "Inconnu")
-        msg = (
-            f"🎯 {tp_name} ATTEINT\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"🎯 {tp_name} : {tp_value}\n"
-            f"💰 P&L : {pnl:+.2f} $\n"
-            f"🎫 Ticket : #{ticket}\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
-
-    async def on_sl_hit(self, ticket, sig, pnl):
-        canal = sig.get("source_channel", "Inconnu")
-        zone = f"{sig['zone_low']}-{sig['zone_high']}"
-        msg = (
-            f"🔴 SL TOUCHÉ\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"📍 Zone : {zone}\n"
-            f"❌ SL : {sig['sl']}\n"
-            f"💸 P&L : {pnl:+.2f} $\n"
-            f"🎫 Ticket : #{ticket}\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
-
-    async def on_trade_closed(self, entry, total_pnl):
-        sig = entry["signal"]
-        canal = sig.get("source_channel", "Inconnu")
-        zone = f"{sig['zone_low']}-{sig['zone_high']}"
-        emoji = "✅" if total_pnl >= 0 else "❌"
-        mode_tag = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
-        msg = (
-            f"{emoji} TRADE FERMÉ {mode_tag}\n"
-            f"━━━━━━━━━━━━━━━━━━\n"
-            f"📅 {datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S}\n"
-            f"📡 Canal : {canal}\n"
-            f"📊 {sig['symbol']} {sig['action']}\n"
-            f"📍 Zone : {zone}\n"
-            f"❌ SL : {sig['sl']}\n"
-            f"💰 P&L TOTAL : {total_pnl:+.2f} $\n"
-            f"━━━━━━━━━━━━━━━━━━"
-        )
-        await self.send_tg(msg)
-
-
-# =============================================================
-# SHUTDOWN TIMER
-# =============================================================
-async def shutdown_watcher(reporter, tracker, bridge, manager, news_mgr):
-    """Surveille le temps restant et envoie le rapport avant fermeture."""
-
-    if RUNTIME_MINUTES <= 0:
-        log.info("[SHUTDOWN] Pas de durée définie → pas de timer")
-        return
-
-    end_time = START_TIME + timedelta(minutes=RUNTIME_MINUTES)
-    log.info(
-        f"[SHUTDOWN] Session de {RUNTIME_MINUTES} min → "
-        f"fin prévue à {end_time:%H:%M:%S}"
-    )
-
-    while not _shutdown_event.is_set():
-        now = datetime.now(timezone.utc)
-        remaining = (end_time - now).total_seconds() / 60
-
-        if remaining <= SHUTDOWN_MARGIN_MIN and not _report_event.is_set():
-            _report_event.set()
-            log.info(
-                f"[SHUTDOWN] Fin dans {remaining:.0f} min → "
-                f"envoi du rapport final"
-            )
-            await tracker.send_final_report(reporter)
-            log.info("[SHUTDOWN] Rapport envoyé. Le bot continue...")
-            break
-
-        if int(remaining) % 5 == 0 and remaining > SHUTDOWN_MARGIN_MIN:
-            log.info(f"[SHUTDOWN] Reste {remaining:.0f} min")
-
-        await asyncio.sleep(30)
-
-
-def sigterm_handler():
-    """Appelé quand SIGTERM est reçu (timeout GitHub Actions)."""
-    log.info("[SHUTDOWN] SIGTERM reçu → arrêt propre")
-    _shutdown_event.set()
-    if not _report_event.is_set():
-        _report_event.set()
-        log.info("[SHUTDOWN] Envoi forcé du rapport...")
 
 
 # =============================================================
@@ -1846,7 +1675,6 @@ def sigterm_handler():
 async def main():
     parser = SignalParser()
     bridge = MT5Bridge()
-    reporter = TradeReporter()
     tracker = PerformanceTracker()
     manager = None
 
@@ -1855,7 +1683,7 @@ async def main():
         return
 
     # v4.2: TradeManager async
-    manager = TradeManager(bridge, reporter, tracker)
+    manager = TradeManager(bridge, tracker)
     await manager.start()
 
     news_mgr = NewsManager(bridge)
@@ -1866,23 +1694,15 @@ async def main():
     await client.start()
     log.info("Telegram connecté.")
 
-    await reporter.set_telegram_client(client)
-
-    loop = asyncio.get_running_loop()
-    try:
-        loop.add_signal_handler(signal.SIGTERM, sigterm_handler)
-        log.info("[SHUTDOWN] SIGTERM handler installé")
-    except NotImplementedError:
-        signal.signal(signal.SIGTERM, lambda s, f: sigterm_handler())
-        log.info("[SHUTDOWN] SIGTERM handler installé (fallback)")
-
     chats = []
 
     channel_names = [
-        ("TG_CHANNEL", CHANNEL_NAME),
+        ("TG_CHANNEL_1", CHANNEL_NAME),
         ("TG_CHANNEL_2", CHANNEL_NAME_2),
         ("TG_CHANNEL_3", CHANNEL_NAME_3),
         ("TG_CHANNEL_4", CHANNEL_NAME_4),
+        ("TG_CHANNEL_5", CHANNEL_NAME_5),
+        ("TG_CHANNEL_6", CHANNEL_NAME_6),
     ]
 
     channel_list = [ch for _, ch in channel_names if ch]
@@ -1949,10 +1769,6 @@ async def main():
                 log.info("[NEWS] Signal ignoré — protection news")
                 return
             execute_signal(signal_data, bridge, manager, tracker)
-            for entry in manager.active:
-                if entry["signal"] is signal_data:
-                    await reporter.on_order_opened(entry)
-                    break
 
     # Banner
     mode = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
@@ -1962,8 +1778,6 @@ async def main():
     for env_name, ch_value in channel_names:
         if ch_value:
             log.info(f"  {env_name} : {ch_value}")
-    if REPORT_CHANNEL:
-        log.info(f" Canal de rapport : {REPORT_CHANNEL}")
     log.info(f" Lot : {LOT_SIZE}")
     log.info(f" Trail SL : {TRAIL_POINTS} pts")
     log.info(f" News filter : {'ON' if NEWS_ENABLED else 'OFF'}")
@@ -1971,23 +1785,12 @@ async def main():
     if RUNTIME_MINUTES > 0:
         end = START_TIME + timedelta(minutes=RUNTIME_MINUTES)
         log.info(f" Session : {RUNTIME_MINUTES} min (fin {end:%H:%M})")
-    log.info(f" Performance : Supabase + rapports Telegram")
+    log.info(f" Performance : Supabase")
     log.info("=" * 55)
 
     try:
-        shutdown_task = asyncio.create_task(
-            shutdown_watcher(reporter, tracker, bridge, manager, news_mgr)
-        )
         await client.run_until_disconnected()
     finally:
-        if not _report_event.is_set() and reporter._tg_client:
-            _report_event.set()
-            log.info("[SHUTDOWN] Envoi du rapport final (finally)...")
-            try:
-                await tracker.send_final_report(reporter)
-            except Exception as e:
-                log.error(f"[SHUTDOWN] Erreur rapport final : {e}")
-
         if _supa_connected and _supa:
             total_t = len(tracker._trades_cache)
             total_p = sum(t.get("pnl", 0) for t in tracker._trades_cache)
@@ -1997,6 +1800,7 @@ async def main():
         if news_mgr:
             news_mgr.stop()
         bridge.disconnect()
+        tracker.print_final_report()
         log.info("[SHUTDOWN] Bot arrêté proprement.")
 
 
