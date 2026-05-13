@@ -468,15 +468,6 @@ class MT5Bridge:
             return ORDER_FILLING_IOC
         return ORDER_FILLING_RETURN
 
-    def _force_filling(self, sym_info) -> int:
-        candidates = [ORDER_FILLING_FOK, ORDER_FILLING_IOC, ORDER_FILLING_RETURN]
-        filling = sym_info.filling_mode
-        if filling & SYMBOL_FILLING_FOK:
-            return ORDER_FILLING_FOK
-        if filling & SYMBOL_FILLING_IOC:
-            return ORDER_FILLING_IOC
-        return ORDER_FILLING_RETURN
-
     def current_price(self, symbol: str, action: str) -> float | None:
         sym_info = self._sym(symbol)
         if sym_info is None:
@@ -900,7 +891,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     if in_zone:
         # ─────────────────────────────────────────────
         # CAS 1: Prix dans la zone
-        # 1 × MARKET avec TP=TP2
+        # 1 × MARKET avec TP=TP_final
         # 1 × LIMIT entre SL et zone avec TP=TP_final
         # ─────────────────────────────────────────────
 
@@ -970,8 +961,6 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         # ─────────────────────────────────────────────
 
         lot_per_order = max(round(LOT_SIZE / 2, 2), sym_info.volume_min)
-        if lot_per_order < sym_info.volume_min:
-            lot_per_order = sym_info.volume_min
 
         if action == "BUY":
             # Prix au-dessus de la zone → limit en dessous
@@ -1304,6 +1293,10 @@ class TradeManager:
             # Scénario C: les 2 remplies → fermer limit_1, SL limit_2 = entrée limit_1, trailing
             # ─────────────────────────────────────────
 
+            # Skip si déjà traité
+            if entry.get("_cas2_handled"):
+                continue
+
             # Récupérer le niveau TP3 depuis l'entrée
             cas2_tp3_level = 0
             for t in entry["tickets"]:
@@ -1360,6 +1353,7 @@ class TradeManager:
                         if o.get("role") in ("limit_1", "limit_2"):
                             self.bridge.cancel_order(o["order"])
                             entry["orders"].remove(o)
+                    entry["_cas2_handled"] = True
 
                 elif limit1_was_filled and not limit2_was_filled:
                     # Scénario B: limit_1 remplie, limit_2 jamais remplie
@@ -1383,6 +1377,7 @@ class TradeManager:
                             )
                             cas2_limit1_tk["trail_active"] = True
                             cas2_limit1_tk["sl_step"] = 1
+                    entry["_cas2_handled"] = True
 
                 elif limit1_was_filled and limit2_was_filled:
                     # Scénario C: les 2 remplies → fermer limit_1 manuellement à TP3
@@ -1410,6 +1405,7 @@ class TradeManager:
                             limit2_ticket["trail_active"] = True
                             limit2_ticket["sl_step"] = 1
                             log.info(f"  → Trail activé sur limit_2 #{limit2_ticket['ticket']} vers TP_final")
+                    entry["_cas2_handled"] = True
 
             # Trailing SL update for active positions
             # (activation is handled by CAS 1/CAS 2 specific code above)
@@ -1579,7 +1575,7 @@ async def main():
     # Banner
     mode = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
     log.info("=" * 55)
-    log.info(f" TRADINGBOT V4.4 — {mode}")
+    log.info(f" TRADINGBOT V4.5 — {mode}")
     log.info(f" Canaux surveillés : {len(chats)}")
     for env_name, ch_value in channel_names:
         if ch_value:
