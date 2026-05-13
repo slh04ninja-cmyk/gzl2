@@ -1,6 +1,6 @@
 # Context.md — TradingBot GZL2
 
-> **Dernière mise à jour :** 2026-05-14
+> **Dernière mise à jour :** 2026-05-14 (v4.5.0)
 > **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
@@ -94,21 +94,32 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 ## 📊 Stratégie d'exécution
 
 ### CAS 1 : Prix dans la zone d'entrée
-- **MARKET** (50% lot) → TP = TP2
-- **LIMIT** (50% lot) entre SL et zone → TP = TP_final
-- Quand TP2 atteint → BE + trailing sur le limit
+- **MARKET** (50% lot) → TP = tp_final
+- **LIMIT** (50% lot) entre SL et zone → TP = tp_final
+- **Scénario A** : LIMIT non exécuté → annuler LIMIT, MARKET trailing seul
+- **Scénario B** : LIMIT exécuté → fermer MARKET à TP3, SL du LIMIT = entrée MARKET, trailing
 
 ### CAS 2 : Prix hors zone
-- **LIMIT_1** (50% lot) au bord de la zone → TP = TP_final
-- **LIMIT_2** (50% lot) côté opposé de la zone → TP = TP_final
-- Quand TP2 atteint :
-  - Option A : aucun rempli → annuler tout
-  - Option B : limit_1 rempli → annuler limit_2, trailing sur limit_1
-  - Option C : les 2 remplis → fermer limit_1, SL limit_2 → entrée L1, trailing sur L2
+- **LIMIT_1** (50% lot) au bord de la zone → TP = tp_final
+- **LIMIT_2** (50% lot) côté opposé de la zone → TP = tp_final
+- **Scénario A** : aucun rempli, TP3 atteint → annuler les 2
+- **Scénario B** : limit_1 rempli → annuler limit_2, SL limit_1 = entrée limit_1, trailing
+- **Scénario C** : les 2 remplis → fermer limit_1 à TP3, SL limit_2 = entrée limit_1, trailing
+- **Scénario D** : SL touché → tout fermé
+
+### TP_TRIGGER (déclencheur BE/trailing)
+- Configurable via workflow input `tp_trigger` (défaut : 3)
+- Déclenche le BE + trailing à TPn au lieu de TP2
+- Si `TP_TRIGGER > nombre de TPs du signal` → signal ignoré
+- Si `tp3 == tp_final` → fallback automatique à `TP_TRIGGER - 1`
+- Variable env : `TP_TRIGGER`
+
+### Trailing SL
+- Gap : 2$ (TRAIL_POINTS=200 pour XAUUSD)
+- Activé uniquement après TP_TRIGGER atteint
+- SL suit le prix à distance fixe (2$)
 
 ### Gestion du risque
-- SL trailing activé après TP2
-- BE (breakeven) après TP1
 - Max positions : 6
 - Max spread : 50 points
 - Filtre news Forex Factory (HIGH impact USD/XAU)
@@ -131,6 +142,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
+- **v4.5.0** (2026-05-14) : gestion trades CAS 1/2 refonte, TP_TRIGGER dynamique, trailing 2$
 - **v4.4.0** (2026-05-14) : 6 canaux TG, parser V5.1, suppression rapports TG
 - **v4.3.2** (2026-05-05) : diagnostic logs, TradeReporter fix
 - **v4.2** : async-safe, volume broker, BE/trailing fixes
@@ -143,3 +155,5 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Les secrets (MT5, TG) sont injectés par le workflow GitHub Actions
 - Le filtre horaire est désactivé (TIME_FILTER_ENABLED = False)
 - REPORT_CHANNEL n'est plus utilisé (rapports TG supprimés)
+- `TP_TRIGGER` est configurable via le workflow (input `tp_trigger`, défaut 3)
+- Le trailing est en gap fixe de 2$ (TRAIL_POINTS=200), pas en points MT5
