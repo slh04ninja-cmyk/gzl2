@@ -67,6 +67,9 @@ for _i, _name in enumerate([CHANNEL_NAME, CHANNEL_NAME_2, CHANNEL_NAME_3,
         CHANNEL_NUM_MAP[_name] = _i
         if _name.lstrip("-").isdigit():
             CHANNEL_NUM_MAP[_name.lstrip("-")] = _i
+            # Stocker aussi avec le tiret pour lookup direct
+            if _name not in CHANNEL_NUM_MAP:
+                CHANNEL_NUM_MAP[_name] = _i
 
 MT5_LOGIN    = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
@@ -1097,7 +1100,7 @@ class TradeManager:
 
     def _get_last_pnl(self, ticket: int, symbol: str) -> float:
         """Get P&L for a closed position. Filtre post-requête par symbole exact."""
-        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        since = datetime.now(timezone.utc) - timedelta(days=7)
         # v4.2: Pas de group=symbol (pattern regex dangereux)
         deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
         if deals:
@@ -1112,12 +1115,32 @@ class TradeManager:
                     return deal.profit
         return 0.0
 
+    def _get_close_reason(self, ticket: int, symbol: str) -> str:
+        """Get close reason for a position. Returns 'TP', 'SL', or 'OTHER'."""
+        since = datetime.now(timezone.utc) - timedelta(days=7)
+        deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
+        if deals:
+            for deal in reversed(deals):
+                if deal.symbol == symbol and (deal.position_id == ticket or deal.order == ticket):
+                    if deal.entry == mt5.DEAL_ENTRY_OUT:
+                        if deal.reason == mt5.DEAL_REASON_TP:
+                            return "TP"
+                        elif deal.reason == mt5.DEAL_REASON_SL:
+                            return "SL"
+            for deal in reversed(deals):
+                if deal.position_id == ticket and deal.entry == mt5.DEAL_ENTRY_OUT:
+                    if deal.reason == mt5.DEAL_REASON_TP:
+                        return "TP"
+                    elif deal.reason == mt5.DEAL_REASON_SL:
+                        return "SL"
+        return "OTHER"
+
     def _get_pos(self, ticket: int):
         r = mt5.positions_get(ticket=ticket)
         return r[0] if r else None
 
     def _resolve_order(self, order_ticket: int, symbol: str):
-        since = datetime.now(timezone.utc) - timedelta(hours=24)
+        since = datetime.now(timezone.utc) - timedelta(days=7)
         deals = mt5.history_deals_get(since, datetime.now(timezone.utc))
         if not deals:
             return None
@@ -1199,16 +1222,26 @@ class TradeManager:
                     tp_idx = t.get("tp_index", -1)
                     tp_val = t.get("tp_target", 0)
                     tp_indices_closed.add(tp_idx)
-                    if pnl >= 0:
+                    close_reason = self._get_close_reason(t["ticket"], symbol)
+                    if close_reason == "TP":
                         if _supa_connected and _supa:
                             supa_id = entry.get("_supa_trade_id")
                             if supa_id:
                                 _supa.log_tp_hit(supa_id, f"TP{tp_idx+1}", tp_val, pnl)
-                    else:
+                    elif close_reason == "SL":
                         if _supa_connected and _supa:
                             supa_id = entry.get("_supa_trade_id")
                             if supa_id:
                                 _supa.log_sl_hit(supa_id, pnl)
+                    else:
+                        # OTHER (manual close, etc.) — log as TP if positive, SL if negative
+                        if _supa_connected and _supa:
+                            supa_id = entry.get("_supa_trade_id")
+                            if supa_id:
+                                if pnl >= 0:
+                                    _supa.log_tp_hit(supa_id, f"TP{tp_idx+1}", tp_val, pnl)
+                                else:
+                                    _supa.log_sl_hit(supa_id, pnl)
 
             # ─────────────────────────────────────────
             # CAS 1: TP3 hité → gérer le limit_catch
@@ -1467,10 +1500,6 @@ class TradeManager:
                             label="[Trail SELL]",
                         )
                         t["trail_last_price"] = current
-                            t["ticket"],
-                            round(nsl, d),
-                            label="[Trail SELL]",
-                        )
 
             # Check if trade fully closed
             active_tks = [

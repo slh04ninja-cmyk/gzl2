@@ -159,7 +159,7 @@ def _extract_tps(text: str) -> list[float]:
 
     # ── Pattern 1: TP1: 4628, TP2: 4631, TP.1: 3245 ──
     for m in re.finditer(
-        r"TP[\.\s]*(\d+)\s*[:\s\-]*\(?(\d+\.?\d*)\)?",
+        r"\bTP[\.\s]*(\d+)\s*[:\s\-]*\(?(\d+\.?\d*)\)?",
         text, re.IGNORECASE
     ):
         num = int(m.group(1))
@@ -258,7 +258,9 @@ def _extract_sl(text: str) -> float | None:
         text, re.IGNORECASE
     )
     if m:
-        return float(m.group(1))
+        val = float(m.group(1))
+        if 1000 <= val <= 9999:
+            return val
 
     # Pattern 2: SL BREAKOUT 4650
     m = re.search(
@@ -266,7 +268,9 @@ def _extract_sl(text: str) -> float | None:
         text, re.IGNORECASE
     )
     if m:
-        return float(m.group(1))
+        val = float(m.group(1))
+        if 1000 <= val <= 9999:
+            return val
 
     # Pattern 3: SL: 4615, SL_4646, SL_ 4646, SL-4650, SL. 4650
     m = re.search(
@@ -274,7 +278,9 @@ def _extract_sl(text: str) -> float | None:
         text, re.IGNORECASE
     )
     if m:
-        return float(m.group(1))
+        val = float(m.group(1))
+        if 1000 <= val <= 9999:
+            return val
 
     # Pattern 4: (SL): 4615, (SL) 4615
     m = re.search(
@@ -282,7 +288,9 @@ def _extract_sl(text: str) -> float | None:
         text, re.IGNORECASE
     )
     if m:
-        return float(m.group(1))
+        val = float(m.group(1))
+        if 1000 <= val <= 9999:
+            return val
 
     # Pattern 5: STOP: 4650, STOP 4650
     m = re.search(
@@ -300,7 +308,9 @@ def _extract_sl(text: str) -> float | None:
         text, re.IGNORECASE
     )
     if m:
-        return float(m.group(1))
+        val = float(m.group(1))
+        if 1000 <= val <= 9999:
+            return val
 
     # Pattern 7: SL sans séparateur mais suivi d'un nombre à 4 chiffres
     m = re.search(
