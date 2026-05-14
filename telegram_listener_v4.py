@@ -1589,6 +1589,9 @@ async def main():
             title = getattr(entity, "title", ch_value)
             chats.append(entity)
             entity_to_name[entity.id] = title
+            # Ajouter le titre dans CHANNEL_NUM_MAP pour le lookup CHn-Cm
+            ch_num = int(env_name.replace("TG_CHANNEL_", ""))
+            CHANNEL_NUM_MAP[title] = ch_num
             log.info(f"Canal : {title} ({env_name}={ch_value})")
         except Exception as e:
             log.warning(f"Canal introuvable ({env_name}={ch_value}) : {e}")
