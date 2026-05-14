@@ -186,13 +186,19 @@ def _extract_tps(text: str) -> list[float]:
                     num = len(tps) + 1
                 tps[num] = val
 
-    # ── Pattern 3: ✅ TP1: 4628, ☑️ TP 4633 ──
+    # ── Pattern 3: ✅ TP1: 4628, ☑️ TP 4633, ✅TP.⁴ 4688 ──
     if not tps:
         for m in re.finditer(
-            r"[✅☑️✔️🎯]\s*TP[\.\s]*(\d+)?\s*[:\s]*\(?(\d+\.?\d*)\)?",
+            r"[✅☑️✔️🎯]\s*TP[\.\s]*([\d⁰¹²³⁴⁵⁶⁷⁸⁹]+)?\s*[:\s]*\(?(\d+\.?\d*)\)?",
             text, re.IGNORECASE
         ):
-            num = int(m.group(1)) if m.group(1) else len(tps) + 1
+            if m.group(1):
+                sup_map = {'⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4',
+                           '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9'}
+                num_str = ''.join(sup_map.get(ch, ch) for ch in m.group(1))
+                num = int(num_str) if num_str.isdigit() else len(tps) + 1
+            else:
+                num = len(tps) + 1
             val = float(m.group(2))
             if 1000 <= val <= 9999:
                 tps[num] = val

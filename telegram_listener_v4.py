@@ -852,17 +852,6 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         )
         return
 
-    # Filtre SL trop proche de l'entrée (< 0.5% du prix)
-    # Ex: SL 3 chiffres pour XAUUSD (590 au lieu de 5190)
-    sl_distance = abs(avg_entry - sl)
-    sl_pct = sl_distance / avg_entry * 100
-    if sl_pct < 0.5:
-        log.warning(
-            f"Signal ignoré — SL trop proche de l'entrée: SL={sl} entry={avg_entry} "
-            f"(distance={sl_distance:.1f}, {sl_pct:.2f}%) — probable SL malformé"
-        )
-        return
-
     tick = mt5.symbol_info_tick(sym_info.name)
     if tick and not DEMO_MODE:
         spread_points = abs(tick.ask - tick.bid)
