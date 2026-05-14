@@ -1,6 +1,6 @@
 # Context.md — TradingBot GZL2
 
-> **Dernière mise à jour :** 2026-05-14 (v4.5.0)
+> **Dernière mise à jour :** 2026-05-14 (v4.5.1)
 > **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
@@ -88,6 +88,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 
 ### Validation
 - SL doit être du bon côté (BUY → SL < entry, SELL → SL > entry)
+- SL distance minimale : 0.5% du prix d'entrée (filtre SL malformé)
 - Prix range : 1000-9999
 - Spam filter : 19 mots-clés + standalone filter
 
@@ -142,6 +143,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
+- **v4.5.1** (2026-05-14) : filtre SL malformé (< 0.5% entry), bug CAS 2 retrigger, cleanup
 - **v4.5.0** (2026-05-14) : gestion trades CAS 1/2 refonte, TP_TRIGGER dynamique, trailing 2$
 - **v4.4.0** (2026-05-14) : 6 canaux TG, parser V5.1, suppression rapports TG
 - **v4.3.2** (2026-05-05) : diagnostic logs, TradeReporter fix
