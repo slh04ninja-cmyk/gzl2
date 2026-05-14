@@ -60,6 +60,7 @@ RE_RANGE = re.compile(
 # SPAM FILTER
 # =============================================================
 EXCLUDE_KEYWORDS = [
+    "hit",
     "tp hit", "tp1 hit", "tp2 hit", "tp3 hit", "all tp hit",
     "mission acomplished", "boom boom boom",
     "my signal are on fire", "pips profit", "pips gain",
