@@ -1,6 +1,6 @@
 # Context.md — TradingBot GZL2
 
-> **Dernière mise à jour :** 2026-05-14 (v4.5.1)
+> **Dernière mise à jour :** 2026-05-14 (v4.6.0)
 > **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
@@ -62,7 +62,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 3. `TPn (prix)` — `TP1: (3245)`
 4. `TAKE PROFIT n prix` — `TAKE PROFIT 1: 4655`
 5. `TAKE PROFIT WORD prix` — `TAKE PROFIT ONE 4650`
-6. `✅ TPn: prix` — emoji checkmark
+6. `✅ TPn: prix` / `✅TPⁿ prix` — emoji checkmark (avec ou sans espace)
 7. `TPⁿ prix` — superscript Unicode (TP¹, TP², TPⁿ)
 8. `TARGET n prix` / `TGT n prix`
 9. `TP prix` — ligne seule sans numéro
@@ -88,9 +88,13 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 
 ### Validation
 - SL doit être du bon côté (BUY → SL < entry, SELL → SL > entry)
-- SL distance minimale : 0.5% du prix d'entrée (filtre SL malformé)
 - Prix range : 1000-9999
-- Spam filter : 19 mots-clés + standalone filter
+- Spam filter : `hit`, `pips` + 17 mots-clés + standalone filter
+
+### Commentaire MT5
+- Chaque ordre porte un commentaire `CHn-Cm` (ex: `CH2-C1`)
+- `CHn` = numéro du canal Telegram (TG_CHANNEL_1 → CH1, etc.)
+- `C1` = CAS 1 (prix dans la zone), `C2` = CAS 2 (prix hors zone)
 
 ## 📊 Stratégie d'exécution
 
@@ -143,6 +147,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
+- **v4.6.0** (2026-05-14) : suppression filtre SL 0.5%, fix parser superscript TP sans espace, spam filter `hit`/`pips`, commentaire MT5 CHn-Cm
 - **v4.5.1** (2026-05-14) : filtre SL malformé (< 0.5% entry), bug CAS 2 retrigger, cleanup
 - **v4.5.0** (2026-05-14) : gestion trades CAS 1/2 refonte, TP_TRIGGER dynamique, trailing 2$
 - **v4.4.0** (2026-05-14) : 6 canaux TG, parser V5.1, suppression rapports TG
