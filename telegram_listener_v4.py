@@ -1257,6 +1257,7 @@ class TradeManager:
                             )
                             limit_ticket["trail_active"] = True
                             limit_ticket["sl_step"] = 1
+                            limit_ticket["trail_last_price"] = current
                             log.info(f"Trail activé #{limit_ticket['ticket']} après TP3")
                         else:
                             log.info(
@@ -1288,6 +1289,7 @@ class TradeManager:
                                 "tp_final":    limit_order["tp_final"],
                                 "sl_step":     1,
                                 "trail_active": True,
+                                "trail_last_price": current,
                             }
                             entry["tickets"].append(tk)
                             entry["orders"].remove(limit_order)
@@ -1391,6 +1393,7 @@ class TradeManager:
                                 label="[SL CAS2 TP3]"
                             )
                             cas2_limit1_tk["trail_active"] = True
+                            cas2_limit1_tk["trail_last_price"] = current
                             cas2_limit1_tk["sl_step"] = 1
                     entry["_cas2_handled"] = True
 
@@ -1419,11 +1422,12 @@ class TradeManager:
                             )
                             limit2_ticket["trail_active"] = True
                             limit2_ticket["sl_step"] = 1
+                            limit2_ticket["trail_last_price"] = current
                             log.info(f"  → Trail activé sur limit_2 #{limit2_ticket['ticket']} vers TP_final")
                     entry["_cas2_handled"] = True
 
             # Trailing SL update for active positions
-            # (activation is handled by CAS 1/CAS 2 specific code above)
+            # Ratio 1:2 — SL bouge de 2$ pour chaque 4$ de mouvement de prix
             for t in entry["tickets"]:
                 if not t.get("trail_active"):
                     continue
@@ -1439,19 +1443,30 @@ class TradeManager:
                     if d in (3, 5)
                     else sym2.point
                 )
-                gap = TRAIL_POINTS * pv
+                trail_step = TRAIL_POINTS * pv       # 2$ (200 pts)
+                trigger_step = trail_step * 2         # 4$ (400 pts)
+                last_price = t.get("trail_last_price", 0)
+
                 if action == "BUY":
-                    nsl = current - gap
-                    if pos.sl == 0 or nsl > pos.sl:
+                    price_moved = current - last_price
+                    if price_moved >= trigger_step:
+                        nsl = pos.sl + trail_step if pos.sl > 0 else current - trail_step
                         self.bridge.modify_sl(
                             t["ticket"],
                             round(nsl, d),
                             label="[Trail BUY]",
                         )
+                        t["trail_last_price"] = current
                 else:
-                    nsl = current + gap
-                    if pos.sl == 0 or nsl < pos.sl:
+                    price_moved = last_price - current
+                    if price_moved >= trigger_step:
+                        nsl = pos.sl - trail_step if pos.sl > 0 else current + trail_step
                         self.bridge.modify_sl(
+                            t["ticket"],
+                            round(nsl, d),
+                            label="[Trail SELL]",
+                        )
+                        t["trail_last_price"] = current
                             t["ticket"],
                             round(nsl, d),
                             label="[Trail SELL]",
