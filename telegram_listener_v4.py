@@ -59,6 +59,15 @@ CHANNEL_NAME_4 = os.getenv("TG_CHANNEL_4", "")
 CHANNEL_NAME_5 = os.getenv("TG_CHANNEL_5", "")
 CHANNEL_NAME_6 = os.getenv("TG_CHANNEL_6", "")
 
+# Mapping canal → numéro (pour commentaire MT5)
+CHANNEL_NUM_MAP = {}
+for _i, _name in enumerate([CHANNEL_NAME, CHANNEL_NAME_2, CHANNEL_NAME_3,
+                             CHANNEL_NAME_4, CHANNEL_NAME_5, CHANNEL_NAME_6], 1):
+    if _name:
+        CHANNEL_NUM_MAP[_name] = _i
+        if _name.lstrip("-").isdigit():
+            CHANNEL_NUM_MAP[_name.lstrip("-")] = _i
+
 MT5_LOGIN    = int(os.getenv("MT5_LOGIN", "0"))
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER   = os.getenv("MT5_SERVER", "")
@@ -502,7 +511,7 @@ class MT5Bridge:
         return lot
 
     def place_market_order(
-        self, signal: dict, lot: float, tp: float
+        self, signal: dict, lot: float, tp: float, comment: str = "TG-market"
     ) -> int | None:
         log.info(f"[DEBUG] place_market_order ENTRÉE sym={signal['symbol']} action={signal['action']} lot={lot} tp={tp}")
         sym = self._sym(signal["symbol"])
@@ -546,7 +555,7 @@ class MT5Bridge:
                     "tp": round(tp, sym.digits),
                     "deviation": SLIPPAGE,
                     "magic": MAGIC_NUMBER,
-                    "comment": f"TG-market {datetime.now(timezone.utc):%H:%M}",
+                    "comment": comment,
                     "type_time": mt5.ORDER_TIME_GTC,
                     "type_filling": fill_mode,
                 }
@@ -571,7 +580,7 @@ class MT5Bridge:
 
     def place_limit_order(
         self, signal: dict, lot: float, price: float,
-        tp: float, expiry: datetime
+        tp: float, expiry: datetime, comment: str = "TG-limit"
     ) -> int | None:
         sym = self._sym(signal["symbol"])
         if not sym:
@@ -602,7 +611,7 @@ class MT5Bridge:
                 "tp": round(tp, sym.digits),
                 "deviation": SLIPPAGE,
                 "magic": MAGIC_NUMBER,
-                "comment": f"TG-limit {datetime.now(timezone.utc):%H:%M}",
+                "comment": comment,
                 "type_time": mt5.ORDER_TIME_SPECIFIED,
                 "expiration": int(expiry.timestamp()),
                 "type_filling": filling,
@@ -875,8 +884,14 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     in_zone = zone_low <= current <= zone_high
     canal = signal.get("source_channel", "Inconnu")
     mode = "DEMO" if DEMO_MODE else "LIVE"
+
+    # Commentaire MT5 : CHn-Cm (numéro canal + cas)
+    ch_num = CHANNEL_NUM_MAP.get(canal, CHANNEL_NUM_MAP.get(canal.lstrip("-"), "?"))
+    cas_num = 1 if in_zone else 2
+    mt5_comment = f"CH{ch_num}-C{cas_num}"
+
     log.info("=" * 55)
-    log.info(f"SIGNAL [{mode}] {action} {symbol} | Canal: {canal}")
+    log.info(f"SIGNAL [{mode}] {action} {symbol} | Canal: {canal} ({mt5_comment})")
     log.info(
         f"Zone [{zone_low} — {zone_mid} — {zone_high}] | Prix={current}"
     )
@@ -904,7 +919,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         # 1) MARKET order avec TP=TP_final
         log.info(f"CAS 1 → MARKET {action} lot={lot_market} TP={tp_final} SL={sl}")
         try:
-            t = bridge.place_market_order(signal, lot_market, tp=tp_final)
+            t = bridge.place_market_order(signal, lot_market, tp=tp_final, comment=mt5_comment)
         except Exception as e:
             log.error(f"MARKET EXCEPTION: {e}")
             t = None
@@ -934,7 +949,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
             limit_price = round((zone_high + sl) / 2, sym_info.digits)
 
         log.info(f"CAS 1 → LIMIT {action} @{limit_price} lot={lot_limit} TP={tp_final} SL={sl}")
-        o = bridge.place_limit_order(signal, lot_limit, limit_price, tp_final, expiry)
+        o = bridge.place_limit_order(signal, lot_limit, limit_price, tp_final, expiry, comment=mt5_comment)
         if o:
             orders.append({
                 "order": o,
@@ -973,7 +988,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
 
         # Limit 1: zone_edge → TP=TP_final
         log.info(f"CAS 2 → LIMIT_1 {action} @{price_1} lot={lot_per_order} TP={tp_final} SL={sl}")
-        o1 = bridge.place_limit_order(signal, lot_per_order, price_1, tp_final, expiry)
+        o1 = bridge.place_limit_order(signal, lot_per_order, price_1, tp_final, expiry, comment=mt5_comment)
         if o1:
             tp_idx_1 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
             orders.append({
@@ -994,7 +1009,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
 
         # Limit 2: zone_opposite → TP=TP_final
         log.info(f"CAS 2 → LIMIT_2 {action} @{price_2} lot={lot_per_order} TP={tp_final} SL={sl}")
-        o2 = bridge.place_limit_order(signal, lot_per_order, price_2, tp_final, expiry)
+        o2 = bridge.place_limit_order(signal, lot_per_order, price_2, tp_final, expiry, comment=mt5_comment)
         if o2:
             tp_idx_2 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
             orders.append({
