@@ -1,6 +1,6 @@
 # Context.md — TradingBot GZL2
 
-> **Dernière mise à jour :** 2026-05-14 (v4.6.0)
+> **Dernière mise à jour :** 2026-05-15 (v4.6.1)
 > **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
@@ -88,7 +88,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 
 ### Validation
 - SL doit être du bon côté (BUY → SL < entry, SELL → SL > entry)
-- Prix range : 1000-9999
+- Prix range : 1000-9999 (appliqué sur tous les patterns SL et TP)
 - Spam filter : `hit`, `pips` + 17 mots-clés + standalone filter
 
 ### Commentaire MT5
@@ -120,9 +120,9 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Variable env : `TP_TRIGGER`
 
 ### Trailing SL
-- Gap : 2$ (TRAIL_POINTS=200 pour XAUUSD)
+- Ratio 1:2 — SL avance de 2$ pour chaque 4$ de mouvement de prix (TRAIL_POINTS=200)
 - Activé uniquement après TP_TRIGGER atteint
-- SL suit le prix à distance fixe (2$)
+- SL suit le prix par paliers de 2$, déclenchés seulement quand le prix a bougé de 4$ depuis le dernier mouvement
 
 ### Gestion du risque
 - Max positions : 6
@@ -147,6 +147,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
+- **v4.6.1** (2026-05-15) : fix PnL 0 pour trades >24h (fenêtre 7j), fix TP/SL logging (DEAL_REASON_TP/SL), fix CHANNEL_NUM_MAP lookup titre canal, SL validation range (patterns 1-4,6), TP Pattern 1 boundary \b, trailing ratio 1:2, cleanup doublon trailing
 - **v4.6.0** (2026-05-14) : suppression filtre SL 0.5%, fix parser superscript TP sans espace, spam filter `hit`/`pips`, commentaire MT5 CHn-Cm
 - **v4.5.1** (2026-05-14) : filtre SL malformé (< 0.5% entry), bug CAS 2 retrigger, cleanup
 - **v4.5.0** (2026-05-14) : gestion trades CAS 1/2 refonte, TP_TRIGGER dynamique, trailing 2$
@@ -163,4 +164,4 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Le filtre horaire est désactivé (TIME_FILTER_ENABLED = False)
 - REPORT_CHANNEL n'est plus utilisé (rapports TG supprimés)
 - `TP_TRIGGER` est configurable via le workflow (input `tp_trigger`, défaut 3)
-- Le trailing est en gap fixe de 2$ (TRAIL_POINTS=200), pas en points MT5
+- Le trailing est en ratio 1:2 (TRAIL_POINTS=200, gap 2$ pour 4$ de mouvement), pas en gap fixe
