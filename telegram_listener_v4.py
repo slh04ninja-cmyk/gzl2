@@ -1086,62 +1086,97 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     else:
         # ─────────────────────────────────────────────
         # CAS 2: Prix hors zone
-        # 2 × LIMIT: zone_edge + zone_opposite, TP=TP_final pour les 2
-        # Le code gère la fermeture/BE/trailing à TP2
+        # Si prix entre zone et TP1 → MARKET @ prix actuel
+        # Sinon → 2 × LIMIT aux limites de zone
         # ─────────────────────────────────────────────
 
-        lot_per_order = max(round(LOT_SIZE / 2, 2), sym_info.volume_min)
+        tp1 = all_tps[0]
 
+        # Déterminer si le prix est entre la zone et TP1
         if action == "BUY":
-            # Prix au-dessus de la zone → limit en dessous
-            price_1 = zone_high   # zone edge (plus proche du prix)
-            price_2 = zone_low    # zone opposite (plus loin)
-        else:
-            # Prix en dessous de la zone → limit au-dessus
-            price_1 = zone_low    # zone edge (plus proche du prix)
-            price_2 = zone_high   # zone opposite (plus loin)
+            between_zone_tp1 = zone_high < current < tp1
+        else:  # SELL
+            between_zone_tp1 = tp1 < current < zone_low
 
-        # Limit 1: zone_edge → TP=TP_final
-        log.info(f"CAS 2 → LIMIT_1 {action} @{price_1} lot={lot_per_order} TP={tp_final} SL={sl}")
-        o1 = bridge.place_limit_order(signal, lot_per_order, price_1, tp_final, expiry, comment=mt5_comment)
-        if o1:
-            tp_idx_1 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
-            orders.append({
-                "order":      o1,
-                "lot":        lot_per_order,
-                "price":      price_1,
-                "role":       "limit_1",
-                "tp_index":   tp_idx_1,
-                "tp_target":  tp_final,
-                "tp3":        tp3,
-                "tp_final":   tp_final,
-                "sl_step":    0,
-                "trail_active": False,
-            })
-            log.info(f"  ✓ LIMIT_1 #{o1} @{price_1} TP={tp_final}")
-        else:
-            log.error(f"  ✗ LIMIT_1 échoué @{price_1}")
+        if between_zone_tp1:
+            # ── Prix entre zone et TP1 → MARKET ──
+            log.info(f"CAS 2 → Prix entre zone et TP1 ({zone_low}-{zone_high} ↔ {tp1}) | prix={current}")
+            log.info(f"  → MARKET {action} @{current} lot={LOT_SIZE} TP={tp_final} SL={sl}")
+            try:
+                t = bridge.place_market_order(signal, LOT_SIZE, tp=tp_final, comment=mt5_comment)
+            except Exception as e:
+                log.error(f"  MARKET EXCEPTION: {e}")
+                t = None
 
-        # Limit 2: zone_opposite → TP=TP_final
-        log.info(f"CAS 2 → LIMIT_2 {action} @{price_2} lot={lot_per_order} TP={tp_final} SL={sl}")
-        o2 = bridge.place_limit_order(signal, lot_per_order, price_2, tp_final, expiry, comment=mt5_comment)
-        if o2:
-            tp_idx_2 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
-            orders.append({
-                "order":      o2,
-                "lot":        lot_per_order,
-                "price":      price_2,
-                "role":       "limit_2",
-                "tp_index":   tp_idx_2,
-                "tp_target":  tp_final,
-                "tp3":        tp3,
-                "tp_final":   tp_final,
-                "sl_step":    0,
-                "trail_active": False,
-            })
-            log.info(f"  ✓ LIMIT_2 #{o2} @{price_2} TP={tp_final}")
+            if t:
+                tickets.append({
+                    "ticket": t,
+                    "lot": LOT_SIZE,
+                    "role": "market_cas2",
+                    "entry_price": current,
+                    "tp_index": tp_trigger_idx,
+                    "tp_target": tp3,
+                    "tp3": tp3,
+                    "tp_final": tp_final,
+                    "sl_step": 0,
+                    "trail_active": False,
+                })
+                log.info(f"  ✓ MARKET #{t} @{current} TP={tp_final} (TP3 trigger={tp3})")
+            else:
+                log.error("  ✗ MARKET échoué")
+
         else:
-            log.error(f"  ✗ LIMIT_2 échoué @{price_2}")
+            # ── Prix loin de la zone → 2 × LIMIT ──
+            lot_per_order = max(round(LOT_SIZE / 2, 2), sym_info.volume_min)
+
+            if action == "BUY":
+                price_1 = zone_high   # zone edge (plus proche du prix)
+                price_2 = zone_low    # zone opposite (plus loin)
+            else:
+                price_1 = zone_low    # zone edge (plus proche du prix)
+                price_2 = zone_high   # zone opposite (plus loin)
+
+            # Limit 1: zone_edge → TP=TP_final
+            log.info(f"CAS 2 → LIMIT_1 {action} @{price_1} lot={lot_per_order} TP={tp_final} SL={sl}")
+            o1 = bridge.place_limit_order(signal, lot_per_order, price_1, tp_final, expiry, comment=mt5_comment)
+            if o1:
+                tp_idx_1 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
+                orders.append({
+                    "order":      o1,
+                    "lot":        lot_per_order,
+                    "price":      price_1,
+                    "role":       "limit_1",
+                    "tp_index":   tp_idx_1,
+                    "tp_target":  tp_final,
+                    "tp3":        tp3,
+                    "tp_final":   tp_final,
+                    "sl_step":    0,
+                    "trail_active": False,
+                })
+                log.info(f"  ✓ LIMIT_1 #{o1} @{price_1} TP={tp_final}")
+            else:
+                log.error(f"  ✗ LIMIT_1 échoué @{price_1}")
+
+            # Limit 2: zone_opposite → TP=TP_final
+            log.info(f"CAS 2 → LIMIT_2 {action} @{price_2} lot={lot_per_order} TP={tp_final} SL={sl}")
+            o2 = bridge.place_limit_order(signal, lot_per_order, price_2, tp_final, expiry, comment=mt5_comment)
+            if o2:
+                tp_idx_2 = all_tps.index(tp_final) if tp_final in all_tps else len(all_tps) - 1
+                orders.append({
+                    "order":      o2,
+                    "lot":        lot_per_order,
+                    "price":      price_2,
+                    "role":       "limit_2",
+                    "tp_index":   tp_idx_2,
+                    "tp_target":  tp_final,
+                    "tp3":        tp3,
+                    "tp_final":   tp_final,
+                    "sl_step":    0,
+                    "trail_active": False,
+                })
+                log.info(f"  ✓ LIMIT_2 #{o2} @{price_2} TP={tp_final}")
+            else:
+                log.error(f"  ✗ LIMIT_2 échoué @{price_2}")
 
     if not orders and not tickets:
         log.error("Aucun ordre placé.")
