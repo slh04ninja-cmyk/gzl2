@@ -908,6 +908,114 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     log.info(f"TPs={all_tps} ({len(all_tps)}) | SL={sl}")
     log.info("=" * 55)
 
+    # ─────────────────────────────────────────────────────
+    # SIGNAL À PRIX UNIQUE (pas de zone)
+    # Scénario 1: prix entre entry et TP1 → MARKET
+    # Scénario 2: prix entre TP1 et TP2 → LIMIT @ entry
+    # Scénario 3: sinon → annulé
+    # ─────────────────────────────────────────────────────
+    is_single_price = (zone_high - zone_low) <= 1.0  # zone ±0.5 = prix unique
+
+    if is_single_price and len(all_tps) >= 2:
+        entry_price = zone_mid
+        tp1 = all_tps[0]
+        tp2 = all_tps[1]
+
+        # Déterminer les bornes selon BUY/SELL
+        if action == "BUY":
+            low_bound = min(entry_price, tp1)
+            high_bound = max(tp1, tp2)
+        else:  # SELL
+            low_bound = min(tp2, tp1)
+            high_bound = max(tp1, entry_price)
+
+        # Scénario 1 : prix entre entry et TP1
+        if action == "BUY" and entry_price <= current <= tp1:
+            scenario = 1
+        elif action == "SELL" and tp1 <= current <= entry_price:
+            scenario = 1
+        # Scénario 2 : prix entre TP1 et TP2
+        elif action == "BUY" and tp1 < current <= tp2:
+            scenario = 2
+        elif action == "SELL" and tp2 <= current < tp1:
+            scenario = 2
+        # Scénario 3 : sinon
+        else:
+            scenario = 3
+
+        if scenario == 3:
+            log.info(f"PRIX UNIQUE — Scénario 3 : prix={current} hors zone entry-TP2 → ANNULÉ")
+            return
+
+        mt5_comment_single = f"{mt5_comment}-S{scenario}"
+        log.info(f"PRIX UNIQUE — Scénario {scenario} | entry={entry_price} TP1={tp1} TP2={tp2} prix={current}")
+
+        if scenario == 1:
+            # MARKET @ prix actuel
+            log.info(f"  → MARKET {action} @{current} lot={LOT_SIZE} TP={tp_final} SL={sl}")
+            try:
+                t = bridge.place_market_order(signal, LOT_SIZE, tp=tp_final, comment=mt5_comment_single)
+            except Exception as e:
+                log.error(f"  MARKET EXCEPTION: {e}")
+                t = None
+
+            if t:
+                tickets.append({
+                    "ticket": t,
+                    "lot": LOT_SIZE,
+                    "role": "market_single",
+                    "entry_price": current,
+                    "tp_index": tp_trigger_idx,
+                    "tp_target": tp3,
+                    "tp3": tp3,
+                    "tp_final": tp_final,
+                    "sl_step": 0,
+                    "trail_active": False,
+                })
+                log.info(f"  ✓ MARKET #{t} @{current} TP={tp_final}")
+            else:
+                log.error("  ✗ MARKET échoué")
+
+        elif scenario == 2:
+            # LIMIT @ prix du signal
+            log.info(f"  → LIMIT {action} @{entry_price} lot={LOT_SIZE} TP={tp_final} SL={sl}")
+            o = bridge.place_limit_order(signal, LOT_SIZE, entry_price, tp_final, expiry, comment=mt5_comment_single)
+            if o:
+                orders.append({
+                    "order": o,
+                    "lot": LOT_SIZE,
+                    "price": entry_price,
+                    "role": "limit_single",
+                    "tp_index": tp_trigger_idx,
+                    "tp_target": tp3,
+                    "tp3": tp3,
+                    "tp_final": tp_final,
+                    "sl_step": 0,
+                    "trail_active": False,
+                })
+                log.info(f"  ✓ LIMIT #{o} @{entry_price} TP={tp_final}")
+            else:
+                log.error(f"  ✗ LIMIT échoué @{entry_price}")
+
+        # Enregistrer et sortir
+        if not orders and not tickets:
+            log.error("Aucun ordre placé (prix unique).")
+            return
+
+        entry = {
+            "signal": signal,
+            "orders": orders,
+            "tickets": tickets,
+            "expiry": expiry,
+            "_open_date": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        manager.register(entry)
+        tracker.log_trade_open(entry)
+        return
+
+    # ─────────────────────────────────────────────────────
+    # SIGNAL AVEC ZONE (logique existante CAS 1 / CAS 2)
+    # ─────────────────────────────────────────────────────
     orders, tickets = [], []
 
     if in_zone:
