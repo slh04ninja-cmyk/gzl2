@@ -1,6 +1,6 @@
 # Context.md — TradingBot GZL2
 
-> **Dernière mise à jour :** 2026-05-15 (v4.6.1)
+> **Dernière mise à jour :** 2026-05-22 (v6.0)
 > **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
@@ -9,8 +9,8 @@ Bot de copy trading Telegram → MetaTrader 5 (Exness). Écoute des canaux Teleg
 ## 🏗️ Architecture
 ```
 gzl2/
-├── telegram_listener_v4.py   # Bot principal (écoute TG → exécute MT5)
-├── signal_parser.py           # Parser de signaux V5.1 (importé par le bot)
+├── telegram_listener_v4.py   # Bot principal (écoute TG → exécute MT5) — 9 canaux
+├── signal_parser.py           # Parser unifié V6.0 (fusion gzl2 + onee-tech-app)
 ├── supabase_logger.py         # Logger Supabase (sessions, trades, events)
 ├── dashboard.py               # Dashboard Streamlit (visualisation performances)
 ├── bot.env                    # Config fixe (canaux, lots, filtres)
@@ -21,11 +21,7 @@ gzl2/
 ├── HTF_Gold_EA_v*.set          # Fichiers de paramètres EA
 ├── start_bot.bat              # Script de lancement Windows
 └── .github/workflows/         # Déploiement RDP via GitHub Actions
-    ├── rdp-tailscale-bot-v4.yml      # Workflow principal (RDP + Tailscale + Bot)
-    ├── rdp-tailscale-stop.yml        # Nettoyage devices Tailscale
-    ├── rdp-tailscale-rustdesk-A.yml  # RustDesk variant A
-    ├── rdp-tailscale-rustdesk-B.yml  # RustDesk variant B
-    └── rdp-tailscale-bot-A-1.yml     # Bot variant A
+    └── rdp-tailscale-bot-v4.yml      # Workflow principal (RDP + Tailscale + Bot)
 ```
 
 ## 🔧 Technologies
@@ -37,11 +33,27 @@ gzl2/
 - **Python** : 3.11+
 
 ## 📡 Canaux Telegram surveillés
-Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
+Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_9) :
 - `@fxGzl`
-- 5 canaux numériques (IDs négatifs)
+- 8 canaux numériques (IDs négatifs)
 
-## 🔍 Parser de signaux V5.1 (signal_parser.py)
+## 🔍 Parser de signaux V6.0 (signal_parser.py — unifié)
+
+Fusion des parsers de gzl2 (v5.1) et onee-tech-app. Supporte la détection automatique des formats par channel.
+
+### Classes principales
+| Classe | Description |
+|---|---|
+| `SignalParser` | Parser principal — `parse(text)` → `TradeSignal` ou `None` |
+| `TradeSignal` | Objet structuré (signal_type, direction, entry, tps, sl, etc.) |
+| `FormatProfile` | Profil de format d'un channel (direction_style, tp_style, etc.) |
+
+### Fonctions utilitaires
+| Fonction | Description |
+|---|---|
+| `is_spam(text)` | Filtre les messages non-trading |
+| `detect_format(messages)` | Détecte le format d'un channel → `FormatProfile` |
+| `parse_messages(messages)` | Batch parsing → `List[TradeSignal]` |
 
 ### Types de signaux
 | Type | Description |
@@ -56,7 +68,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 3. Inline : `BUY 3240`, `SELL 3240` (sans range)
 4. Fallback : mini-zone ±0.5 autour du prix
 
-### TP supportés (10 patterns)
+### TP supportés (22 patterns)
 1. `TPn: prix` — `TP1: 4628`
 2. `TP.n: prix` — `TP.1: 3245`
 3. `TPn (prix)` — `TP1: (3245)`
@@ -67,8 +79,15 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 8. `TARGET n prix` / `TGT n prix`
 9. `TP prix` — ligne seule sans numéro
 10. `TP. ¹ prix` — point + superscript
+11. `TP.³ prix` — superscript + point
+12. `TP {n}: ({prix})` — parenthèses autour du prix
+13. `TAKE PROFIT {n} ({prix})` — TAKE PROFIT + parenthèses
+14. Multi TP numérotés — `TP1: 3245 TP2: 3250 TP3: 3260`
+15. Minuscule — `tp1: 3245`
+16. Emoji + TP — `🎯 TP1: 3245`
+17-22. Autres variantes (voir code)
 
-### SL supportés (10 patterns)
+### SL supportés (19 patterns)
 1. `Stop Loss (SL): prix`
 2. `STOP LOSS. prix`
 3. `SL BREAKOUT prix`
@@ -79,17 +98,31 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 8. `(SL): prix` (parenthèses)
 9. `STOP: prix`
 10. `🛑 SL prix` (emoji)
+11-19. Autres variantes (voir code)
+
+### Format Detector
+`detect_format(messages)` analyse un échantillon et retourne un `FormatProfile` :
+- `direction_style` : text (BUY/SELL), emoji (🟢🔴), arrow (⬆️⬇️)
+- `entry_style` : labeled (ENTRY:), inline (BUY 3240), at (@3240), range
+- `tp_style` : numbered (TP1/TP2), unnumbered (TP:), emoji (✅), take_profit, superscript (TP¹), target
+- `sl_style` : standard (SL:), stop_loss, breakout (SL BREAKOUT), emoji (🛑)
+- `pair` : XAUUSD, EURUSD, GBPUSD, BTCUSD
+- `has_superscripts` : booléen pour les chiffres Unicode
+- `signal_density` : % de messages qui sont des signaux
+- `confidence` : score de confiance global (0-1)
 
 ### Symboles
 - `XAUUSD`, `GOLD`, `XAU/USD` → XAUUSD
 - `XAGUSD`, `SILVER` → XAGUSD
 - `USOIL`, `OIL` → USOIL
 - `BTCUSD`, `BITCOIN`, `BTC` → BTCUSD
+- `EURUSD`, `EUR/USD` → EURUSD
+- `GBPUSD`, `GBP/USD` → GBPUSD
 
 ### Validation
 - SL doit être du bon côté (BUY → SL < entry, SELL → SL > entry)
 - Prix range : 1000-9999 (appliqué sur tous les patterns SL et TP)
-- Spam filter : `hit`, `pips` + 17 mots-clés + standalone filter
+- Spam filter : `hit`, `pips` + 25 mots-clés + standalone filter
 
 ### Commentaire MT5
 - Chaque ordre porte un commentaire `CHn-Cm` (ex: `CH2-C1`)
@@ -147,6 +180,7 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
+- **v6.0** (2026-05-22) : Parser unifié (fusion gzl2 v5.1 + onee-tech-app), TradeSignal dataclass, FormatProfile + detect_format(), 22 TP + 19 SL patterns, superscript Unicode, 9 canaux TG
 - **v4.6.1** (2026-05-15) : fix PnL 0 pour trades >24h (fenêtre 7j), fix TP/SL logging (DEAL_REASON_TP/SL), fix CHANNEL_NUM_MAP lookup titre canal, SL validation range (patterns 1-4,6), TP Pattern 1 boundary \b, trailing ratio 1:2, cleanup doublon trailing
 - **v4.6.0** (2026-05-14) : suppression filtre SL 0.5%, fix parser superscript TP sans espace, spam filter `hit`/`pips`, commentaire MT5 CHn-Cm
 - **v4.5.1** (2026-05-14) : filtre SL malformé (< 0.5% entry), bug CAS 2 retrigger, cleanup
@@ -158,10 +192,11 @@ Configurés dans `bot.env` (TG_CHANNEL_1 à TG_CHANNEL_6) :
 
 ## ⚠️ Points d'attention
 - Le bot utilise `telegram_listener_v4.py` (pas v4.4.py)
-- Le parser est dans `signal_parser.py` (importé, pas inline)
+- Le parser est dans `signal_parser.py` (V6.0 unifié, fusion gzl2 + onee-tech-app)
 - `bot.env` contient les canaux et paramètres fixes
 - Les secrets (MT5, TG) sont injectés par le workflow GitHub Actions
 - Le filtre horaire est désactivé (TIME_FILTER_ENABLED = False)
 - REPORT_CHANNEL n'est plus utilisé (rapports TG supprimés)
 - `TP_TRIGGER` est configurable via le workflow (input `tp_trigger`, défaut 3)
 - Le trailing est en ratio 1:2 (TRAIL_POINTS=200, gap 2$ pour 4$ de mouvement), pas en gap fixe
+- **9 canaux TG** supportés (TG_CHANNEL_1 à TG_CHANNEL_9)
