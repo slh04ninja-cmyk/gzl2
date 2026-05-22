@@ -375,7 +375,7 @@ class NewsManager:
 # ------------------------------------------------------------------
 # SIGNAL PARSER — importé depuis signal_parser.py (v5.1)
 # ------------------------------------------------------------------
-from signal_parser import SignalParser, is_spam
+from signal_parser import SignalParser, is_spam, TradeSignal, detect_format, FormatProfile
 
 
 # =============================================================
@@ -1615,24 +1615,24 @@ async def main():
         if signal_data is None:
             return
 
-        signal_data["source_channel"] = canal_name
+        signal_data._source_channel = canal_name
 
-        if signal_data["type"] == "CLOSE":
-            bridge.close_all(symbol=signal_data.get("symbol"))
+        if signal_data.signal_type == "CLOSE":
+            bridge.close_all(symbol=signal_data.close_symbol)
             return
 
-        elif signal_data["type"] == "SL_MOVE":
+        elif signal_data.signal_type == "SL_MOVE":
             log.info(
-                f"SL MOVE reçu → nouveau SL={signal_data['new_sl']}"
+                f"SL MOVE reçu → nouveau SL={signal_data.new_sl}"
             )
-            bridge.update_sl_all(signal_data["new_sl"])
+            bridge.update_sl_all(signal_data.new_sl)
             return
 
-        elif signal_data["type"] == "TRADE":
+        elif signal_data.signal_type == "TRADE":
             if NEWS_ENABLED and news_mgr.is_blocked():
                 log.info("[NEWS] Signal ignoré — protection news")
                 return
-            execute_signal(signal_data, bridge, manager, tracker)
+            execute_signal(signal_data.to_dict(), bridge, manager, tracker)
 
     # Banner
     mode = "🧪 DEMO" if DEMO_MODE else "💰 LIVE"
