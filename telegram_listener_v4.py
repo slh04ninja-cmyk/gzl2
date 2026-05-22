@@ -58,11 +58,15 @@ CHANNEL_NAME_3 = os.getenv("TG_CHANNEL_3", "")
 CHANNEL_NAME_4 = os.getenv("TG_CHANNEL_4", "")
 CHANNEL_NAME_5 = os.getenv("TG_CHANNEL_5", "")
 CHANNEL_NAME_6 = os.getenv("TG_CHANNEL_6", "")
+CHANNEL_NAME_7 = os.getenv("TG_CHANNEL_7", "")
+CHANNEL_NAME_8 = os.getenv("TG_CHANNEL_8", "")
+CHANNEL_NAME_9 = os.getenv("TG_CHANNEL_9", "")
 
 # Mapping canal → numéro (pour commentaire MT5)
 CHANNEL_NUM_MAP = {}
 for _i, _name in enumerate([CHANNEL_NAME, CHANNEL_NAME_2, CHANNEL_NAME_3,
-                             CHANNEL_NAME_4, CHANNEL_NAME_5, CHANNEL_NAME_6], 1):
+                             CHANNEL_NAME_4, CHANNEL_NAME_5, CHANNEL_NAME_6,
+                             CHANNEL_NAME_7, CHANNEL_NAME_8, CHANNEL_NAME_9], 1):
     if _name:
         CHANNEL_NUM_MAP[_name] = _i
         if _name.lstrip("-").isdigit():
@@ -1568,6 +1572,9 @@ async def main():
         ("TG_CHANNEL_4", CHANNEL_NAME_4),
         ("TG_CHANNEL_5", CHANNEL_NAME_5),
         ("TG_CHANNEL_6", CHANNEL_NAME_6),
+        ("TG_CHANNEL_7", CHANNEL_NAME_7),
+        ("TG_CHANNEL_8", CHANNEL_NAME_8),
+        ("TG_CHANNEL_9", CHANNEL_NAME_9),
     ]
 
     channel_list = [ch for _, ch in channel_names if ch]
