@@ -1099,11 +1099,21 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
             between_zone_tp1 = tp1 < current < zone_low
 
         if between_zone_tp1:
-            # ── Prix entre zone et TP1 → MARKET ──
+            # ── Prix entre zone et TP1 → MARKET + LIMIT à l'autre limite ──
+            lot_per_order = max(round(LOT_SIZE / 2, 2), sym_info.volume_min)
+
+            # L'autre limite de zone (plus loin du prix)
+            if action == "BUY":
+                other_limit = zone_low
+            else:
+                other_limit = zone_high
+
             log.info(f"CAS 2 → Prix entre zone et TP1 ({zone_low}-{zone_high} ↔ {tp1}) | prix={current}")
-            log.info(f"  → MARKET {action} @{current} lot={LOT_SIZE} TP={tp_final} SL={sl}")
+
+            # 1) MARKET @ prix actuel
+            log.info(f"  → MARKET {action} @{current} lot={lot_per_order} TP={tp_final} SL={sl}")
             try:
-                t = bridge.place_market_order(signal, LOT_SIZE, tp=tp_final, comment=mt5_comment)
+                t = bridge.place_market_order(signal, lot_per_order, tp=tp_final, comment=mt5_comment)
             except Exception as e:
                 log.error(f"  MARKET EXCEPTION: {e}")
                 t = None
@@ -1111,7 +1121,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
             if t:
                 tickets.append({
                     "ticket": t,
-                    "lot": LOT_SIZE,
+                    "lot": lot_per_order,
                     "role": "market_cas2",
                     "entry_price": current,
                     "tp_index": tp_trigger_idx,
@@ -1124,6 +1134,26 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
                 log.info(f"  ✓ MARKET #{t} @{current} TP={tp_final} (TP3 trigger={tp3})")
             else:
                 log.error("  ✗ MARKET échoué")
+
+            # 2) LIMIT à l'autre limite de zone
+            log.info(f"  → LIMIT {action} @{other_limit} lot={lot_per_order} TP={tp_final} SL={sl}")
+            o = bridge.place_limit_order(signal, lot_per_order, other_limit, tp_final, expiry, comment=mt5_comment)
+            if o:
+                orders.append({
+                    "order":      o,
+                    "lot":        lot_per_order,
+                    "price":      other_limit,
+                    "role":       "limit_cas2",
+                    "tp_index":   tp_trigger_idx,
+                    "tp_target":  tp3,
+                    "tp3":        tp3,
+                    "tp_final":   tp_final,
+                    "sl_step":    0,
+                    "trail_active": False,
+                })
+                log.info(f"  ✓ LIMIT #{o} @{other_limit} TP={tp_final}")
+            else:
+                log.error(f"  ✗ LIMIT échoué @{other_limit}")
 
         else:
             # ── Prix loin de la zone → 2 × LIMIT ──
