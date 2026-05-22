@@ -128,6 +128,18 @@ Fusion des parsers de gzl2 (v5.1) et onee-tech-app. Supporte la détection autom
 - Chaque ordre porte un commentaire `CHn-Cm` (ex: `CH2-C1`)
 - `CHn` = numéro du canal Telegram (TG_CHANNEL_1 → CH1, etc.)
 - `C1` = CAS 1 (prix dans la zone), `C2` = CAS 2 (prix hors zone)
+- Signaux à prix unique : `CHn-Cm-S1` ou `CHn-Cm-S2`
+
+### Signaux à prix unique (sans zone)
+Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot crée une mini-zone ±0.5 et applique cette logique :
+
+| Scénario | Condition | Action |
+|----------|-----------|--------|
+| **S1** | Prix entre entry et TP1 | **MARKET** @ prix actuel, lot 0.01 |
+| **S2** | Prix entre TP1 et TP2 | **LIMIT** @ prix du signal, lot 0.01 |
+| **S3** | Sinon (hors zone entry-TP2) | **Annulé** |
+
+La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 
 ## 📊 Stratégie d'exécution
 
@@ -180,7 +192,7 @@ Fusion des parsers de gzl2 (v5.1) et onee-tech-app. Supporte la détection autom
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
-- **v6.0** (2026-05-22) : Parser unifié (fusion gzl2 v5.1 + onee-tech-app), TradeSignal dataclass, FormatProfile + detect_format(), 22 TP + 19 SL patterns, superscript Unicode, 9 canaux TG
+- **v6.0** (2026-05-22) : Parser unifié (fusion gzl2 v5.1 + onee-tech-app), TradeSignal dataclass, FormatProfile + detect_format(), 22 TP + 19 SL patterns, superscript Unicode, 9 canaux TG, signaux prix unique (S1/S2/S3)
 - **v4.6.1** (2026-05-15) : fix PnL 0 pour trades >24h (fenêtre 7j), fix TP/SL logging (DEAL_REASON_TP/SL), fix CHANNEL_NUM_MAP lookup titre canal, SL validation range (patterns 1-4,6), TP Pattern 1 boundary \b, trailing ratio 1:2, cleanup doublon trailing
 - **v4.6.0** (2026-05-14) : suppression filtre SL 0.5%, fix parser superscript TP sans espace, spam filter `hit`/`pips`, commentaire MT5 CHn-Cm
 - **v4.5.1** (2026-05-14) : filtre SL malformé (< 0.5% entry), bug CAS 2 retrigger, cleanup
