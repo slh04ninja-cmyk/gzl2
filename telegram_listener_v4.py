@@ -914,20 +914,12 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     # Scénario 2: prix entre TP1 et TP2 → LIMIT @ entry
     # Scénario 3: sinon → annulé
     # ─────────────────────────────────────────────────────
-    is_single_price = (zone_high - zone_low) <= 1.0  # zone ±0.5 = prix unique
+    is_single_price = signal.get("is_single_price", False)  # détecté par le parser
 
     if is_single_price and len(all_tps) >= 2:
         entry_price = zone_mid
         tp1 = all_tps[0]
         tp2 = all_tps[1]
-
-        # Déterminer les bornes selon BUY/SELL
-        if action == "BUY":
-            low_bound = min(entry_price, tp1)
-            high_bound = max(tp1, tp2)
-        else:  # SELL
-            low_bound = min(tp2, tp1)
-            high_bound = max(tp1, entry_price)
 
         # Scénario 1 : prix entre entry et TP1
         if action == "BUY" and entry_price <= current <= tp1:
@@ -947,14 +939,15 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
             log.info(f"PRIX UNIQUE — Scénario 3 : prix={current} hors zone entry-TP2 → ANNULÉ")
             return
 
-        mt5_comment_single = f"{mt5_comment}-S{scenario}"
+        # Commentaire MT5 : CHn-PU-Sm
+        mt5_comment_pu = f"CH{ch_num}-PU-S{scenario}"
         log.info(f"PRIX UNIQUE — Scénario {scenario} | entry={entry_price} TP1={tp1} TP2={tp2} prix={current}")
 
         if scenario == 1:
             # MARKET @ prix actuel
             log.info(f"  → MARKET {action} @{current} lot={LOT_SIZE} TP={tp_final} SL={sl}")
             try:
-                t = bridge.place_market_order(signal, LOT_SIZE, tp=tp_final, comment=mt5_comment_single)
+                t = bridge.place_market_order(signal, LOT_SIZE, tp=tp_final, comment=mt5_comment_pu)
             except Exception as e:
                 log.error(f"  MARKET EXCEPTION: {e}")
                 t = None
@@ -979,7 +972,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         elif scenario == 2:
             # LIMIT @ prix du signal
             log.info(f"  → LIMIT {action} @{entry_price} lot={LOT_SIZE} TP={tp_final} SL={sl}")
-            o = bridge.place_limit_order(signal, LOT_SIZE, entry_price, tp_final, expiry, comment=mt5_comment_single)
+            o = bridge.place_limit_order(signal, LOT_SIZE, entry_price, tp_final, expiry, comment=mt5_comment_pu)
             if o:
                 orders.append({
                     "order": o,
@@ -1421,31 +1414,91 @@ class TradeManager:
                                     _supa.log_sl_hit(supa_id, pnl)
 
             # ─────────────────────────────────────────
-            # CAS 1: TP3 hité → gérer le limit_catch
-            # Déclencheur : position market disparue (fermée par MT5 au TP)
+            # GESTION UNIFIÉE TP3 — BE + trailing sur position restante
             # ─────────────────────────────────────────
+
+            # === PRIX UNIQUE (market_single / limit_single) ===
+            pu_tp3_level = 0
+            pu_market_tk = None
+            pu_limit_tk = None
+            pu_limit_order = None
+            for t in entry["tickets"]:
+                if t.get("role") == "market_single":
+                    pu_market_tk = t
+                    if t.get("tp3"): pu_tp3_level = t["tp3"]
+                elif t.get("role") == "limit_single":
+                    pu_limit_tk = t
+                    if t.get("tp3") and pu_tp3_level == 0: pu_tp3_level = t["tp3"]
+            for o in entry["orders"]:
+                if o.get("role") == "limit_single":
+                    pu_limit_order = o
+                    if o.get("tp3") and pu_tp3_level == 0: pu_tp3_level = o["tp3"]
+
+            pu_tp3_hit = False
+            if pu_tp3_level > 0:
+                if action == "BUY" and current >= pu_tp3_level:
+                    pu_tp3_hit = True
+                elif action == "SELL" and current <= pu_tp3_level:
+                    pu_tp3_hit = True
+
+            if pu_tp3_hit and not entry.get("_pu_handled"):
+                entry["_pu_handled"] = True
+                log.info("PRIX UNIQUE TP3 atteint → BE + trailing")
+                # S1 : market fermé → chercher limit
+                if pu_market_tk and self._get_pos(pu_market_tk["ticket"]) is None:
+                    if pu_limit_tk:
+                        lpos = self._get_pos(pu_limit_tk["ticket"])
+                        if lpos:
+                            log.info(f"PU → limit exécutée, BE @{pu_market_tk['entry_price']} + trail")
+                            self.bridge.modify_sl(pu_limit_tk["ticket"], pu_market_tk["entry_price"], "[PU TP3 BE]")
+                            pu_limit_tk["trail_active"] = True
+                            pu_limit_tk["sl_step"] = 1
+                            pu_limit_tk["trail_last_price"] = current
+                    elif pu_limit_order:
+                        lpos = self._resolve_order(pu_limit_order["order"], symbol)
+                        if lpos:
+                            log.info(f"PU → limit tardive, BE @{pu_market_tk['entry_price']} + trail")
+                            self.bridge.modify_sl(lpos.ticket, pu_market_tk["entry_price"], "[PU TP3 BE]")
+                            tk = {"ticket": lpos.ticket, "lot": pu_limit_order["lot"], "role": "limit_single",
+                                  "entry_price": lpos.price_open, "tp_index": pu_limit_order.get("tp_index",0),
+                                  "tp_target": pu_limit_order.get("tp_target",0), "tp3": pu_limit_order["tp3"],
+                                  "tp_final": pu_limit_order["tp_final"], "sl_step": 1, "trail_active": True,
+                                  "trail_last_price": current}
+                            entry["tickets"].append(tk)
+                            entry["orders"].remove(pu_limit_order)
+                        else:
+                            self.bridge.cancel_order(pu_limit_order["order"])
+                            entry["orders"].remove(pu_limit_order)
+                # S2 : limit seule, pas de market
+                elif pu_limit_tk and not pu_market_tk:
+                    lpos = self._get_pos(pu_limit_tk["ticket"])
+                    if lpos and not pu_limit_tk.get("trail_active"):
+                        pu_limit_tk["trail_active"] = True
+                        pu_limit_tk["sl_step"] = 1
+                        pu_limit_tk["trail_last_price"] = current
+                        log.info("PU S2 → limit exécutée, trail activé")
+
+            # === CAS 1 : market_tp3 + limit_catch ===
             market_tk = None
             for t in entry["tickets"]:
                 if t.get("role") == "market_tp3":
                     market_tk = t
                     break
 
-            if market_tk:
+            if market_tk and not market_tk.get("_cas1_handled"):
                 market_entry = market_tk.get("entry_price", 0)
-                market_pos   = self._get_pos(market_tk["ticket"])
-                market_closed = market_pos is None  # fermé par MT5 (TP atteint)
+                market_pos = self._get_pos(market_tk["ticket"])
+                market_closed = market_pos is None
 
-                if market_closed and not market_tk.get("_cas1_handled"):
+                if market_closed:
                     market_tk["_cas1_handled"] = True
+                    log.info(f"CAS 1 TP3 atteint → marché #{market_tk['ticket']} fermé")
 
-                    # Chercher le limit dans les tickets déjà résolus
                     limit_ticket = None
                     for tk in entry["tickets"]:
                         if tk.get("role") == "limit_catch":
                             limit_ticket = tk
                             break
-
-                    # Chercher le limit encore pending dans orders
                     limit_order = None
                     for o in entry["orders"]:
                         if o.get("role") == "limit_catch":
@@ -1453,189 +1506,156 @@ class TradeManager:
                             break
 
                     if limit_ticket:
-                        # Scénario B: Limit exécuté → SL du LIMIT = entrée MARKET + trailing
                         pos = self._get_pos(limit_ticket["ticket"])
                         if pos:
-                            log.info(
-                                f"CAS 1 TP3 hité → Limit #{limit_ticket['ticket']} exécuté "
-                                f"@{pos.price_open} → SL vers entrée MARKET ({market_entry})"
-                            )
-                            self.bridge.modify_sl(
-                                limit_ticket["ticket"],
-                                market_entry,
-                                label="[SL after TP3]"
-                            )
+                            log.info(f"CAS 1 → 2-b limit remplie → BE @{market_entry} + trail")
+                            self.bridge.modify_sl(limit_ticket["ticket"], market_entry, "[CAS1 TP3 BE]")
                             limit_ticket["trail_active"] = True
                             limit_ticket["sl_step"] = 1
                             limit_ticket["trail_last_price"] = current
-                            log.info(f"Trail activé #{limit_ticket['ticket']} après TP3")
-                        else:
-                            log.info(
-                                f"CAS 1 TP3 hité → Limit #{limit_ticket['ticket']} déjà fermé"
-                            )
-
                     elif limit_order:
-                        # Vérifier si le limit pending vient d'être exécuté
                         pos = self._resolve_order(limit_order["order"], symbol)
                         if pos:
-                            # Scénario B: Limit exécuté → SL du LIMIT = entrée MARKET + trailing
-                            log.info(
-                                f"CAS 1 TP3 hité → Limit #{limit_order['order']} exécuté "
-                                f"@{pos.price_open} → SL vers entrée MARKET ({market_entry})"
-                            )
-                            self.bridge.modify_sl(
-                                pos.ticket,
-                                market_entry,
-                                label="[SL after TP3]"
-                            )
-                            tk = {
-                                "ticket":      pos.ticket,
-                                "lot":         limit_order["lot"],
-                                "role":        "limit_catch",
-                                "entry_price": pos.price_open,
-                                "tp_index":    limit_order.get("tp_index", 0),
-                                "tp_target":   limit_order.get("tp_target", 0),
-                                "tp3":         limit_order["tp3"],
-                                "tp_final":    limit_order["tp_final"],
-                                "sl_step":     1,
-                                "trail_active": True,
-                                "trail_last_price": current,
-                            }
+                            log.info(f"CAS 1 → 2-b limit tardive → BE @{market_entry} + trail")
+                            self.bridge.modify_sl(pos.ticket, market_entry, "[CAS1 TP3 BE]")
+                            tk = {"ticket": pos.ticket, "lot": limit_order["lot"], "role": "limit_catch",
+                                  "entry_price": pos.price_open, "tp_index": limit_order.get("tp_index",0),
+                                  "tp_target": limit_order.get("tp_target",0), "tp3": limit_order["tp3"],
+                                  "tp_final": limit_order["tp_final"], "sl_step": 1, "trail_active": True,
+                                  "trail_last_price": current}
                             entry["tickets"].append(tk)
                             entry["orders"].remove(limit_order)
-                            log.info(f"Trail activé #{pos.ticket} après TP3")
                         else:
-                            # Scénario A: Limit PAS exécuté → annuler
-                            log.info(
-                                f"CAS 1 TP3 hité → Limit #{limit_order['order']} non exécuté → annulation"
-                            )
+                            log.info(f"CAS 1 → 2-a limit non remplie → annulation #{limit_order['order']}")
                             self.bridge.cancel_order(limit_order["order"])
                             entry["orders"].remove(limit_order)
 
-            # ─────────────────────────────────────────
-            # CAS 2: Prix atteint TP3 → gérer limit_1 et limit_2
-            # Les 2 limits ont TP=TP_final
-            # Scénario A: aucun rempli → annuler les 2
-            # Scénario B: limit_1 remplie → annuler limit_2, SL limit_1 = entrée limit_1, trailing
-            # Scénario C: les 2 remplies → fermer limit_1, SL limit_2 = entrée limit_1, trailing
-            # ─────────────────────────────────────────
-
-            # Skip si déjà traité
-            if entry.get("_cas2_handled"):
-                continue
-
-            # Récupérer le niveau TP3 depuis l'entrée
-            cas2_tp3_level = 0
-            for t in entry["tickets"]:
-                if t.get("tp3"):
-                    cas2_tp3_level = t["tp3"]
-                    break
-            if cas2_tp3_level == 0:
+            # === CAS 2-a : market_cas2 + limit_cas2 (prix entre zone et TP1) ===
+            if not entry.get("_cas2a_handled"):
+                mc2_tk = None
+                lc2_tk = None
+                lc2_order = None
+                for t in entry["tickets"]:
+                    if t.get("role") == "market_cas2":
+                        mc2_tk = t
+                    elif t.get("role") == "limit_cas2":
+                        lc2_tk = t
                 for o in entry["orders"]:
-                    if o.get("tp3"):
-                        cas2_tp3_level = o["tp3"]
+                    if o.get("role") == "limit_cas2":
+                        lc2_order = o
+
+                if mc2_tk:
+                    mc2_pos = self._get_pos(mc2_tk["ticket"])
+                    if mc2_pos is None:
+                        entry["_cas2a_handled"] = True
+                        market_entry_c2 = mc2_tk.get("entry_price", 0)
+                        log.info(f"CAS 2-a TP3 atteint → market #{mc2_tk['ticket']} fermé")
+                        if lc2_tk:
+                            lpos = self._get_pos(lc2_tk["ticket"])
+                            if lpos:
+                                log.info(f"CAS 2-a → 3-a-2 limit remplie → BE @{market_entry_c2} + trail")
+                                self.bridge.modify_sl(lc2_tk["ticket"], market_entry_c2, "[C2a TP3 BE]")
+                                lc2_tk["trail_active"] = True
+                                lc2_tk["sl_step"] = 1
+                                lc2_tk["trail_last_price"] = current
+                        elif lc2_order:
+                            lpos = self._resolve_order(lc2_order["order"], symbol)
+                            if lpos:
+                                log.info(f"CAS 2-a → 3-a-2 limit tardive → BE @{market_entry_c2} + trail")
+                                self.bridge.modify_sl(lpos.ticket, market_entry_c2, "[C2a TP3 BE]")
+                                tk = {"ticket": lpos.ticket, "lot": lc2_order["lot"], "role": "limit_cas2",
+                                      "entry_price": lpos.price_open, "tp_index": lc2_order.get("tp_index",0),
+                                      "tp_target": lc2_order.get("tp_target",0), "tp3": lc2_order["tp3"],
+                                      "tp_final": lc2_order["tp_final"], "sl_step": 1, "trail_active": True,
+                                      "trail_last_price": current}
+                                entry["tickets"].append(tk)
+                                entry["orders"].remove(lc2_order)
+                            else:
+                                log.info(f"CAS 2-a → 3-a-1 limit non remplie → annulation #{lc2_order['order']}")
+                                self.bridge.cancel_order(lc2_order["order"])
+                                entry["orders"].remove(lc2_order)
+
+            # === CAS 2-b : limit_1 + limit_2 (prix loin de la zone) ===
+            if not entry.get("_cas2_handled"):
+                cas2_tp3_level = 0
+                for t in entry["tickets"]:
+                    if t.get("tp3"):
+                        cas2_tp3_level = t["tp3"]
                         break
+                if cas2_tp3_level == 0:
+                    for o in entry["orders"]:
+                        if o.get("tp3"):
+                            cas2_tp3_level = o["tp3"]
+                            break
 
-            # Déclencheur : prix a atteint TP3
-            cas2_tp3_hit = False
-            if cas2_tp3_level > 0:
-                if action == "BUY" and current >= cas2_tp3_level:
-                    cas2_tp3_hit = True
-                elif action == "SELL" and current <= cas2_tp3_level:
-                    cas2_tp3_hit = True
+                cas2_tp3_hit = False
+                if cas2_tp3_level > 0:
+                    if action == "BUY" and current >= cas2_tp3_level:
+                        cas2_tp3_hit = True
+                    elif action == "SELL" and current <= cas2_tp3_level:
+                        cas2_tp3_hit = True
 
-            if cas2_tp3_hit:
-                # Trouver limit_1 dans les tickets (remplie) et les orders (pending)
-                cas2_limit1_tk = None
-                for tk in entry["tickets"]:
-                    if tk.get("role") == "limit_1":
-                        cas2_limit1_tk = tk
-                        break
-                cas2_limit1_order = None
-                for o in entry["orders"]:
-                    if o.get("role") == "limit_1":
-                        cas2_limit1_order = o
-                        break
+                if cas2_tp3_hit:
+                    cas2_limit1_tk = None
+                    for tk in entry["tickets"]:
+                        if tk.get("role") == "limit_1":
+                            cas2_limit1_tk = tk
+                            break
+                    cas2_limit1_order = None
+                    for o in entry["orders"]:
+                        if o.get("role") == "limit_1":
+                            cas2_limit1_order = o
+                            break
+                    limit2_ticket = None
+                    for tk in entry["tickets"]:
+                        if tk.get("role") == "limit_2":
+                            limit2_ticket = tk
+                            break
+                    limit2_order = None
+                    for o in entry["orders"]:
+                        if o.get("role") == "limit_2":
+                            limit2_order = o
+                            break
 
-                # Trouver limit_2 dans les tickets (remplie) et les orders (pending)
-                limit2_ticket = None
-                for tk in entry["tickets"]:
-                    if tk.get("role") == "limit_2":
-                        limit2_ticket = tk
-                        break
-                limit2_order = None
-                for o in entry["orders"]:
-                    if o.get("role") == "limit_2":
-                        limit2_order = o
-                        break
+                    l1_filled = cas2_limit1_tk is not None and cas2_limit1_tk.get("entry_price", 0) > 0
+                    l2_filled = limit2_ticket is not None and limit2_ticket.get("entry_price", 0) > 0
 
-                # Vérifier si chaque limit a été remplie (a un ticket avec entry_price)
-                limit1_was_filled = cas2_limit1_tk is not None and cas2_limit1_tk.get("entry_price", 0) > 0
-                limit2_was_filled = limit2_ticket is not None and limit2_ticket.get("entry_price", 0) > 0
+                    if not l1_filled and not l2_filled:
+                        log.info("CAS 2-b TP3 → 3-b-1 aucun rempli → annulation des 2 limits")
+                        for o in list(entry["orders"]):
+                            if o.get("role") in ("limit_1", "limit_2"):
+                                self.bridge.cancel_order(o["order"])
+                                entry["orders"].remove(o)
+                        entry["_cas2_handled"] = True
 
-                if not limit1_was_filled and not limit2_was_filled:
-                    # Scénario A: aucun ordre rempli → annuler TOUS les ordres pending
-                    log.info("CAS 2 Scénario A → prix a atteint TP3 sans remplir les limits → annuler tout")
-                    for o in list(entry["orders"]):
-                        if o.get("role") in ("limit_1", "limit_2"):
-                            self.bridge.cancel_order(o["order"])
-                            entry["orders"].remove(o)
-                    entry["_cas2_handled"] = True
+                    elif l1_filled and not l2_filled:
+                        log.info("CAS 2-b TP3 → 3-b-2 limit_1 remplie → BE @ entry L1 + trail")
+                        if limit2_order:
+                            self.bridge.cancel_order(limit2_order["order"])
+                            entry["orders"].remove(limit2_order)
+                        if cas2_limit1_tk:
+                            l1_entry = cas2_limit1_tk.get("entry_price", 0)
+                            pos1 = self._get_pos(cas2_limit1_tk["ticket"])
+                            if pos1:
+                                self.bridge.modify_sl(cas2_limit1_tk["ticket"], l1_entry, "[C2b TP3 BE]")
+                                cas2_limit1_tk["trail_active"] = True
+                                cas2_limit1_tk["sl_step"] = 1
+                                cas2_limit1_tk["trail_last_price"] = current
+                        entry["_cas2_handled"] = True
 
-                elif limit1_was_filled and not limit2_was_filled:
-                    # Scénario B: limit_1 remplie, limit_2 jamais remplie
-                    # → annuler limit_2 pending + SL de limit_1 = entrée limit_1 + trailing
-                    log.info("CAS 2 Scénario B → limit_1 remplie, prix a atteint TP3")
-                    if limit2_order:
-                        log.info("  → annuler limit_2 pending")
-                        self.bridge.cancel_order(limit2_order["order"])
-                        entry["orders"].remove(limit2_order)
-                    if cas2_limit1_tk:
-                        limit1_entry = cas2_limit1_tk.get("entry_price", 0)
-                        pos1 = self._get_pos(cas2_limit1_tk["ticket"])
-                        if pos1:
-                            log.info(
-                                f"  → SL limit_1 = entrée limit_1 ({limit1_entry}) + trailing vers TP_final"
-                            )
-                            self.bridge.modify_sl(
-                                cas2_limit1_tk["ticket"],
-                                limit1_entry,
-                                label="[SL CAS2 TP3]"
-                            )
-                            cas2_limit1_tk["trail_active"] = True
-                            cas2_limit1_tk["trail_last_price"] = current
-                            cas2_limit1_tk["sl_step"] = 1
-                    entry["_cas2_handled"] = True
-
-                elif limit1_was_filled and limit2_was_filled:
-                    # Scénario C: les 2 remplies → fermer limit_1 manuellement à TP3
-                    # → SL de limit_2 = entrée de limit_1 + trailing vers TP_final
-                    limit1_entry = cas2_limit1_tk.get("entry_price", 0) if cas2_limit1_tk else 0
-                    log.info(
-                        f"CAS 2 Scénario C → les 2 remplies, prix a atteint TP3 "
-                        f"→ fermer limit_1 + SL limit_2 = entrée limit_1 ({limit1_entry}) + trailing vers TP_final"
-                    )
-                    # Fermer limit_1 manuellement
-                    if cas2_limit1_tk and self._get_pos(cas2_limit1_tk["ticket"]):
-                        self.bridge.close_position(
-                            cas2_limit1_tk["ticket"],
-                            comment="CAS2-TP3-manual-close"
-                        )
-                    # SL de limit_2 = entrée de limit_1 + trailing
-                    if limit2_ticket:
-                        pos2 = self._get_pos(limit2_ticket["ticket"])
-                        if pos2 and limit1_entry > 0:
-                            self.bridge.modify_sl(
-                                limit2_ticket["ticket"],
-                                limit1_entry,
-                                label="[SL CAS2 after L1 close TP3]"
-                            )
-                            limit2_ticket["trail_active"] = True
-                            limit2_ticket["sl_step"] = 1
-                            limit2_ticket["trail_last_price"] = current
-                            log.info(f"  → Trail activé sur limit_2 #{limit2_ticket['ticket']} vers TP_final")
-                    entry["_cas2_handled"] = True
-
+                    elif l1_filled and l2_filled:
+                        l1_entry = cas2_limit1_tk.get("entry_price", 0) if cas2_limit1_tk else 0
+                        log.info(f"CAS 2-b TP3 → 3-b-3 les 2 remplies → fermer L1, BE @{l1_entry} + trail L2")
+                        if cas2_limit1_tk and self._get_pos(cas2_limit1_tk["ticket"]):
+                            self.bridge.close_position(cas2_limit1_tk["ticket"], "C2b-TP3-close-L1")
+                        if limit2_ticket:
+                            pos2 = self._get_pos(limit2_ticket["ticket"])
+                            if pos2 and l1_entry > 0:
+                                self.bridge.modify_sl(limit2_ticket["ticket"], l1_entry, "[C2b TP3 BE]")
+                                limit2_ticket["trail_active"] = True
+                                limit2_ticket["sl_step"] = 1
+                                limit2_ticket["trail_last_price"] = current
+                        entry["_cas2_handled"] = True
             # Trailing SL update for active positions
             # Ratio 1:2 — SL bouge de 2$ pour chaque 4$ de mouvement de prix
             for t in entry["tickets"]:

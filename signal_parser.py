@@ -46,6 +46,8 @@ class TradeSignal:
     close_symbol: Optional[str] = None
     # SL_MOVE fields
     new_sl: Optional[float] = None
+    # Single price flag (pas de range, prix unique)
+    is_single_price: bool = False
     # Format metadata
     format_profile: Optional['FormatProfile'] = None
 
@@ -66,6 +68,7 @@ class TradeSignal:
             "new_sl": self.new_sl,
             "close_all": self.close_all,
             "close_symbol": self.close_symbol,
+            "is_single_price": self.is_single_price,
         }
 
     @property
@@ -763,6 +766,7 @@ class SignalParser:
             return None
 
         # Extract entry: range first, then single price
+        is_single_price = False
         zone = _parse_range(text)
         if zone:
             zone_low, zone_high = zone
@@ -771,13 +775,11 @@ class SignalParser:
             if entry_price is not None:
                 zone_low = entry_price
                 zone_high = entry_price
+                is_single_price = True
             else:
                 return None
 
-        if zone_low == zone_high:
-            zone_high = zone_low + 0.5
-            zone_low = zone_low - 0.5
-
+        # Prix unique : garder zone_low == zone_high (pas de mini-zone)
         zone_mid = round((zone_low + zone_high) / 2, 2)
 
         if not action:
@@ -810,6 +812,7 @@ class SignalParser:
             raw_text=text[:200],
             timestamp=timestamp,
             confidence=confidence,
+            is_single_price=is_single_price,
             format_profile=self.format_profile,
         )
 

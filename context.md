@@ -1,6 +1,6 @@
 # Context.md — TradingBot GZL2
 
-> **Dernière mise à jour :** 2026-05-22 (v6.0)
+> **Dernière mise à jour :** 2026-05-24 (v6.1)
 > **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
@@ -66,7 +66,7 @@ Fusion des parsers de gzl2 (v5.1) et onee-tech-app. Supporte la détection autom
 1. Range : `4630/4625`, `4630-4625` → midpoint
 2. Labelé : `ENTRY: 3240`, `OPEN: 3240`, `@ 3240`, `ZONE: 3240`
 3. Inline : `BUY 3240`, `SELL 3240` (sans range)
-4. Fallback : mini-zone ±0.5 autour du prix
+4. Fallback : prix unique direct (pas de mini-zone)
 
 ### TP supportés (22 patterns)
 1. `TPn: prix` — `TP1: 4628`
@@ -125,13 +125,13 @@ Fusion des parsers de gzl2 (v5.1) et onee-tech-app. Supporte la détection autom
 - Spam filter : `hit`, `pips` + 25 mots-clés + standalone filter
 
 ### Commentaire MT5
-- Chaque ordre porte un commentaire `CHn-Cm` (ex: `CH2-C1`)
+- CAS 1/2 : `CHn-Cm` (ex: `CH2-C1`)
 - `CHn` = numéro du canal Telegram (TG_CHANNEL_1 → CH1, etc.)
 - `C1` = CAS 1 (prix dans la zone), `C2` = CAS 2 (prix hors zone)
-- Signaux à prix unique : `CHn-Cm-S1` ou `CHn-Cm-S2`
+- Signaux à prix unique : `CHn-PU-Sm` (ex: `CH3-PU-S1`) avec m = scénario (1 ou 2)
 
 ### Signaux à prix unique (sans zone)
-Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot crée une mini-zone ±0.5 et applique cette logique :
+Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot utilise directement le prix unique (pas de mini-zone ±0.5) :
 
 | Scénario | Condition | Action |
 |----------|-----------|--------|
@@ -144,7 +144,7 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 ## 📊 Stratégie d'exécution
 
 ### Signaux à prix unique (sans zone)
-Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot crée une mini-zone ±0.5 et applique cette logique :
+Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot utilise directement le prix unique (pas de mini-zone ±0.5) :
 
 | Scénario | Condition | Action |
 |----------|-----------|--------|
@@ -157,19 +157,21 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 ### CAS 1 : Prix dans la zone d'entrée
 - **MARKET** (50% lot) → TP = tp_final
 - **LIMIT** (50% lot) entre SL et zone → TP = tp_final
-- **Scénario A** : LIMIT non exécuté → annuler LIMIT, MARKET trailing seul
-- **Scénario B** : LIMIT exécuté → fermer MARKET à TP3, SL du LIMIT = entrée MARKET, trailing
+- **TP3 atteint (2-a)** : LIMIT non exécuté → annuler LIMIT, BE @ entrée MARKET + trailing
+- **TP3 atteint (2-b)** : LIMIT exécuté → fermer MARKET, BE @ entrée MARKET + trailing sur LIMIT
 
 ### CAS 2 : Prix hors zone
 - **Si prix entre zone et TP1** :
   - **MARKET** @ prix actuel (50% lot) → TP = tp_final
   - **LIMIT** @ l'autre limite de zone (50% lot) → TP = tp_final
+  - **TP3 atteint (3-a-1)** : LIMIT non exécuté → annuler LIMIT, BE @ entrée MARKET + trailing
+  - **TP3 atteint (3-a-2)** : LIMIT exécuté → fermer MARKET, BE @ entrée MARKET + trailing sur LIMIT
 - **Si prix loin de la zone (au-delà de TP1)** :
   - **LIMIT_1** (50% lot) au bord de la zone → TP = tp_final
   - **LIMIT_2** (50% lot) côté opposé de la zone → TP = tp_final
-- **Scénario A** : aucun rempli, TP3 atteint → annuler les 2
-- **Scénario B** : limit_1 rempli → annuler limit_2, SL limit_1 = entrée limit_1, trailing
-- **Scénario C** : les 2 remplis → fermer limit_1 à TP3, SL limit_2 = entrée limit_1, trailing
+  - **TP3 atteint (3-b-1)** : aucun rempli → annuler les 2
+  - **TP3 atteint (3-b-2)** : LIMIT_1 remplie, LIMIT_2 non → annuler LIMIT_2, BE @ entrée LIMIT_1 + trailing
+  - **TP3 atteint (3-b-3)** : les 2 remplies → fermer LIMIT_1, BE @ entrée LIMIT_1 + trailing sur LIMIT_2
 - **Scénario D** : SL touché → tout fermé
 
 ### TP_TRIGGER (déclencheur BE/trailing)
@@ -207,6 +209,7 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
+- **v6.1** (2026-05-24) : Prix unique détecté par le parser (is_single_price flag, pas de mini-zone), commentaire MT5 CHn-PU-Sm, gestion TP3 unifiée tous cas (BE @ entrée, trailing, fermeture manuelle)
 - **v6.0** (2026-05-22) : Parser unifié (fusion gzl2 v5.1 + onee-tech-app), TradeSignal dataclass, FormatProfile + detect_format(), 22 TP + 19 SL patterns, superscript Unicode, 9 canaux TG, signaux prix unique (S1/S2/S3), CAS 2 amélioré (MARKET si prix entre zone et TP1)
 - **v4.6.1** (2026-05-15) : fix PnL 0 pour trades >24h (fenêtre 7j), fix TP/SL logging (DEAL_REASON_TP/SL), fix CHANNEL_NUM_MAP lookup titre canal, SL validation range (patterns 1-4,6), TP Pattern 1 boundary \b, trailing ratio 1:2, cleanup doublon trailing
 - **v4.6.0** (2026-05-14) : suppression filtre SL 0.5%, fix parser superscript TP sans espace, spam filter `hit`/`pips`, commentaire MT5 CHn-Cm
