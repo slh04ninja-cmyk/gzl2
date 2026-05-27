@@ -243,9 +243,9 @@ EXCLUDE_KEYWORDS = [
     "are you in big loss", "contact",
 
     "good morning", "good night", "hello", "welcome", "thank",
-    "recap", "result", "education", "motivation",
+    "recap", "result", "motivation",
     "join", "vip", "subscribe", "premium",
-    "signal will", "analysis only", "not signal",
+    "will", "analysis only", "not signal",
 ]
 
 SPAM_STANDALONE = ["target", "running"]
@@ -356,7 +356,7 @@ SL_PATTERNS = {
 NOISE_PATTERNS = [
     r'GOOD\s*(MORNING|NIGHT|EVENING)',
     r'(HELLO|WELCOME|THANK)',
-    r'(RECAP|RESULT|EDUCATION|MOTIVATION)',
+    r'(RECAP|RESULT|MOTIVATION)',
     r'(JOIN|VIP|SUBSCRIBE|PREMIUM)',
     r'SIGNAL\s*WILL',
     r'ANALYSIS\s*ONLY',
