@@ -143,12 +143,11 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 
 ## 📊 Stratégie d'exécution
 
-### Détection TP3 — Vérification OHLC (v6.2)
-Le bot vérifie si le prix a atteint le niveau TP3 via les **bougies OHLC M1** (bougie en cours), pas par vérification directe du prix. Cela garantit qu'aucun passage à TP3 n'est raté, même bref.
-
-- Intervalle de polling configurable via `POLL_INTERVAL_SEC` dans `bot.env` (défaut : 5s)
-- Vérifie le **High** (BUY) ou **Low** (SELL) des 5 dernières bougies M1
-- Utilise `mt5.copy_rates_from_pos(symbol, TIMEFRAME_M1, 0, 5)`
+### Détection TP3 — P&L fixe (v6.2)
+Le bot vérifie si une position a atteint le seuil de P&L fixe configuré dans `bot.env` :
+- `PNL_TRIGGER_USD` : montant en $ pour déclencher BE + trailing (défaut : 5.0$)
+- Intervalle de polling configurable via `POLL_INTERVAL_SEC` (défaut : 5s)
+- Vérifie le profit de chaque position ouverte à chaque cycle
 
 ### Signaux à prix unique (sans zone)
 Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot utilise directement le prix unique (pas de mini-zone ±0.5) :
@@ -227,7 +226,7 @@ Le bot détecte les fermetures manuelles (pas par TP/SL) :
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
-- **v6.2** (2026-05-28) : Vérification TP3 via OHLC (bougie en cours), polling configurable POLL_INTERVAL_SEC (défaut 5s), correction CAS 1/2-a (vérifier niveau prix TP3 au lieu de position fermée), correction PU S2 (BE avant trailing), règle pending annulé / ouverte continue BE+trailing
+- **v6.2** (2026-05-28) : P&L fixe comme trigger BE/trailing (PNL_TRIGGER_USD), polling configurable POLL_INTERVAL_SEC, correction CAS 1/2-a (vérifier P&L au lieu de position fermée), correction PU S2 (BE avant trailing), règle pending annulé / ouverte continue BE+trailing
 - **v6.1** (2026-05-24) : Prix unique détecté par le parser (is_single_price flag, pas de mini-zone), commentaire MT5 CHn-PU-Sm, gestion TP3 unifiée tous cas (BE @ entrée, trailing, fermeture manuelle)
 - **v6.0** (2026-05-22) : Parser unifié (fusion gzl2 v5.1 + onee-tech-app), TradeSignal dataclass, FormatProfile + detect_format(), 22 TP + 19 SL patterns, superscript Unicode, 9 canaux TG, signaux prix unique (S1/S2/S3), CAS 2 amélioré (MARKET si prix entre zone et TP1)
 - **v4.6.1** (2026-05-15) : fix PnL 0 pour trades >24h (fenêtre 7j), fix TP/SL logging (DEAL_REASON_TP/SL), fix CHANNEL_NUM_MAP lookup titre canal, SL validation range (patterns 1-4,6), TP Pattern 1 boundary \b, trailing ratio 1:2, cleanup doublon trailing

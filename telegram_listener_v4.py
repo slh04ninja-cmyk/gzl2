@@ -106,6 +106,7 @@ OPEN_TP_COUNT = int(os.getenv("OPEN_TP_COUNT", "3"))
 OPEN_TRAIL_AFTER_TP = int(os.getenv("OPEN_TRAIL_AFTER_TP", "1"))
 
 POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "5"))
+PNL_TRIGGER_USD = float(os.getenv("PNL_TRIGGER_USD", "5.0"))
 
 RUNTIME_MINUTES = int(os.getenv("RUNTIME_MINUTES", "0"))
 SHUTDOWN_MARGIN_MIN = 5
@@ -1261,21 +1262,15 @@ class TradeManager:
         if self._task:
             self._task.cancel()
 
-    def _check_tp3_ohlc(self, symbol: str, tp3_level: float, action: str) -> bool:
-        """Vérifie si le prix a touché TP3 via les bougies OHLC (bougie en cours)."""
-        try:
-            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 5)
-            if rates is None or len(rates) == 0:
-                return False
-            for rate in rates:
-                if action == "BUY" and rate['high'] >= tp3_level:
-                    return True
-                elif action == "SELL" and rate['low'] <= tp3_level:
-                    return True
-            return False
-        except Exception as e:
-            log.error(f"[OHLC] Erreur vérification TP3: {e}")
-            return False
+    def _check_pnl_trigger(self, entry: dict) -> bool:
+        """Vérifie si une position du trade a atteint le P&L trigger."""
+        for t in entry.get("tickets", []):
+            if t.get("trail_active") or t.get("_pnl_handled"):
+                continue
+            pos = self._get_pos(t["ticket"])
+            if pos and pos.profit >= PNL_TRIGGER_USD:
+                return True
+        return False
 
     async def _loop_async(self):
         """Boucle async avec asyncio.to_thread pour les appels MT5 bloquants."""
@@ -1452,12 +1447,10 @@ class TradeManager:
                     pu_limit_order = o
                     if o.get("tp3") and pu_tp3_level == 0: pu_tp3_level = o["tp3"]
 
-            # Vérifier si TP3 atteint via OHLC
-            pu_tp3_hit = False
-            if pu_tp3_level > 0:
-                pu_tp3_hit = self._check_tp3_ohlc(symbol, pu_tp3_level, action)
+            # Vérifier si P&L trigger atteint
+            pu_pnl_hit = self._check_pnl_trigger(entry)
 
-            if pu_tp3_hit and not entry.get("_pu_handled"):
+            if pu_pnl_hit and not entry.get("_pu_handled"):
                 entry["_pu_handled"] = True
                 log.info("PRIX UNIQUE TP3 atteint → BE + trailing")
                 # S1 : market fermé → chercher limit
@@ -1504,12 +1497,11 @@ class TradeManager:
                     break
 
             if market_tk and not market_tk.get("_cas1_handled"):
-                # Vérifier si TP3 atteint via OHLC
-                tp3_level = market_tk.get("tp3", 0)
-                if tp3_level > 0 and self._check_tp3_ohlc(symbol, tp3_level, action):
+                # Vérifier si P&L trigger atteint
+                if self._check_pnl_trigger(entry):
                     market_tk["_cas1_handled"] = True
                     market_entry = market_tk.get("entry_price", 0)
-                    log.info(f"CAS 1 TP3 atteint ({tp3_level}) → prix={current}")
+                    log.info(f"CAS 1 P&L trigger atteint ({PNL_TRIGGER_USD}$) → prix={current}")
                     
                     limit_ticket = None
                     for tk in entry["tickets"]:
@@ -1588,12 +1580,11 @@ class TradeManager:
                         lc2_order = o
 
                 if mc2_tk:
-                    # Vérifier si TP3 atteint via OHLC
-                    tp3_level = mc2_tk.get("tp3", 0)
-                    if tp3_level > 0 and self._check_tp3_ohlc(symbol, tp3_level, action):
+                    # Vérifier si P&L trigger atteint
+                    if self._check_pnl_trigger(entry):
                         entry["_cas2a_handled"] = True
                         market_entry_c2 = mc2_tk.get("entry_price", 0)
-                        log.info(f"CAS 2-a TP3 atteint ({tp3_level}) → prix={current}")
+                        log.info(f"CAS 2-a P&L trigger atteint ({PNL_TRIGGER_USD}$) → prix={current}")
                         
                         if lc2_tk:
                             # CAS 3-a-2 : LIMIT remplie → fermer MARKET, BE sur LIMIT
@@ -1648,24 +1639,10 @@ class TradeManager:
 
             # === CAS 2-b : limit_1 + limit_2 (prix loin de la zone) ===
             if not entry.get("_cas2_handled"):
-                cas2_tp3_level = 0
-                cas2_symbol = symbol
-                for t in entry["tickets"]:
-                    if t.get("tp3"):
-                        cas2_tp3_level = t["tp3"]
-                        break
-                if cas2_tp3_level == 0:
-                    for o in entry["orders"]:
-                        if o.get("tp3"):
-                            cas2_tp3_level = o["tp3"]
-                            break
+                # Vérifier si P&L trigger atteint
+                cas2_pnl_hit = self._check_pnl_trigger(entry)
 
-                # Vérifier si TP3 atteint via OHLC
-                cas2_tp3_hit = False
-                if cas2_tp3_level > 0:
-                    cas2_tp3_hit = self._check_tp3_ohlc(cas2_symbol, cas2_tp3_level, action)
-
-                if cas2_tp3_hit:
+                if cas2_pnl_hit:
                     cas2_limit1_tk = None
                     for tk in entry["tickets"]:
                         if tk.get("role") == "limit_1":
@@ -1914,7 +1891,7 @@ async def main():
             log.info(f"  {env_name} : {ch_value}")
     log.info(f" Lot : {LOT_SIZE}")
     log.info(f" Trail SL : {TRAIL_POINTS} pts")
-    log.info(f" Poll interval : {POLL_INTERVAL_SEC}s (OHLC)")
+    log.info(f" Poll interval : {POLL_INTERVAL_SEC}s | P&L trigger : {PNL_TRIGGER_USD}$")
     log.info(f" News filter : {'ON' if NEWS_ENABLED else 'OFF'}")
     log.info(f" Time filter : OFF (désactivé temporairement)")
     if RUNTIME_MINUTES > 0:
