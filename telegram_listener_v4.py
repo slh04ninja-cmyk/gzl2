@@ -105,6 +105,8 @@ OPEN_TP_RR_RATIOS = [float(x) for x in os.getenv("OPEN_TP_RR_RATIOS", "1.0,2.0,3
 OPEN_TP_COUNT = int(os.getenv("OPEN_TP_COUNT", "3"))
 OPEN_TRAIL_AFTER_TP = int(os.getenv("OPEN_TRAIL_AFTER_TP", "1"))
 
+POLL_INTERVAL_SEC = int(os.getenv("POLL_INTERVAL_SEC", "5"))
+
 RUNTIME_MINUTES = int(os.getenv("RUNTIME_MINUTES", "0"))
 SHUTDOWN_MARGIN_MIN = 5
 
@@ -1259,10 +1261,26 @@ class TradeManager:
         if self._task:
             self._task.cancel()
 
+    def _check_tp3_ohlc(self, symbol: str, tp3_level: float, action: str) -> bool:
+        """Vérifie si le prix a touché TP3 via les bougies OHLC (bougie en cours)."""
+        try:
+            rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 5)
+            if rates is None or len(rates) == 0:
+                return False
+            for rate in rates:
+                if action == "BUY" and rate['high'] >= tp3_level:
+                    return True
+                elif action == "SELL" and rate['low'] <= tp3_level:
+                    return True
+            return False
+        except Exception as e:
+            log.error(f"[OHLC] Erreur vérification TP3: {e}")
+            return False
+
     async def _loop_async(self):
         """Boucle async avec asyncio.to_thread pour les appels MT5 bloquants."""
         while not self._stop:
-            await asyncio.sleep(10)
+            await asyncio.sleep(POLL_INTERVAL_SEC)
             try:
                 await asyncio.to_thread(self._check_all)
             except Exception as exc:
@@ -1434,12 +1452,10 @@ class TradeManager:
                     pu_limit_order = o
                     if o.get("tp3") and pu_tp3_level == 0: pu_tp3_level = o["tp3"]
 
+            # Vérifier si TP3 atteint via OHLC
             pu_tp3_hit = False
             if pu_tp3_level > 0:
-                if action == "BUY" and current >= pu_tp3_level:
-                    pu_tp3_hit = True
-                elif action == "SELL" and current <= pu_tp3_level:
-                    pu_tp3_hit = True
+                pu_tp3_hit = self._check_tp3_ohlc(symbol, pu_tp3_level, action)
 
             if pu_tp3_hit and not entry.get("_pu_handled"):
                 entry["_pu_handled"] = True
@@ -1473,10 +1489,12 @@ class TradeManager:
                 elif pu_limit_tk and not pu_market_tk:
                     lpos = self._get_pos(pu_limit_tk["ticket"])
                     if lpos and not pu_limit_tk.get("trail_active"):
+                        # BE d'abord
+                        self.bridge.modify_sl(pu_limit_tk["ticket"], pu_limit_tk.get("entry_price", 0), "[PU S2 BE]")
                         pu_limit_tk["trail_active"] = True
                         pu_limit_tk["sl_step"] = 1
                         pu_limit_tk["trail_last_price"] = current
-                        log.info("PU S2 → limit exécutée, trail activé")
+                        log.info("PU S2 → limit exécutée, BE + trail activé")
 
             # === CAS 1 : market_tp3 + limit_catch ===
             market_tk = None
@@ -1486,14 +1504,13 @@ class TradeManager:
                     break
 
             if market_tk and not market_tk.get("_cas1_handled"):
-                market_entry = market_tk.get("entry_price", 0)
-                market_pos = self._get_pos(market_tk["ticket"])
-                market_closed = market_pos is None
-
-                if market_closed:
+                # Vérifier si TP3 atteint via OHLC
+                tp3_level = market_tk.get("tp3", 0)
+                if tp3_level > 0 and self._check_tp3_ohlc(symbol, tp3_level, action):
                     market_tk["_cas1_handled"] = True
-                    log.info(f"CAS 1 TP3 atteint → marché #{market_tk['ticket']} fermé")
-
+                    market_entry = market_tk.get("entry_price", 0)
+                    log.info(f"CAS 1 TP3 atteint ({tp3_level}) → prix={current}")
+                    
                     limit_ticket = None
                     for tk in entry["tickets"]:
                         if tk.get("role") == "limit_catch":
@@ -1506,16 +1523,28 @@ class TradeManager:
                             break
 
                     if limit_ticket:
+                        # CAS 2-b : LIMIT remplie → fermer MARKET, BE sur LIMIT
                         pos = self._get_pos(limit_ticket["ticket"])
                         if pos:
+                            # Fermer le MARKET
+                            market_pos = self._get_pos(market_tk["ticket"])
+                            if market_pos:
+                                self.bridge.close_position(market_tk["ticket"], "CAS1-TP3-close-market")
+                                log.info(f"  MARKET #{market_tk['ticket']} fermé @ TP3")
                             log.info(f"CAS 1 → 2-b limit remplie → BE @{market_entry} + trail")
                             self.bridge.modify_sl(limit_ticket["ticket"], market_entry, "[CAS1 TP3 BE]")
                             limit_ticket["trail_active"] = True
                             limit_ticket["sl_step"] = 1
                             limit_ticket["trail_last_price"] = current
                     elif limit_order:
+                        # CAS 2-a : LIMIT pending → annuler LIMIT, MARKET continue avec BE + trailing
                         pos = self._resolve_order(limit_order["order"], symbol)
                         if pos:
+                            # LIMIT tardive remplie → fermer MARKET, BE sur LIMIT
+                            market_pos = self._get_pos(market_tk["ticket"])
+                            if market_pos:
+                                self.bridge.close_position(market_tk["ticket"], "CAS1-TP3-close-market")
+                                log.info(f"  MARKET #{market_tk['ticket']} fermé @ TP3")
                             log.info(f"CAS 1 → 2-b limit tardive → BE @{market_entry} + trail")
                             self.bridge.modify_sl(pos.ticket, market_entry, "[CAS1 TP3 BE]")
                             tk = {"ticket": pos.ticket, "lot": limit_order["lot"], "role": "limit_catch",
@@ -1526,9 +1555,23 @@ class TradeManager:
                             entry["tickets"].append(tk)
                             entry["orders"].remove(limit_order)
                         else:
+                            # LIMIT non remplie → annuler LIMIT, MARKET continue avec BE + trailing
                             log.info(f"CAS 1 → 2-a limit non remplie → annulation #{limit_order['order']}")
                             self.bridge.cancel_order(limit_order["order"])
                             entry["orders"].remove(limit_order)
+                            # MARKET continue avec BE + trailing
+                            self.bridge.modify_sl(market_tk["ticket"], market_entry, "[CAS1 BE]")
+                            market_tk["trail_active"] = True
+                            market_tk["sl_step"] = 1
+                            market_tk["trail_last_price"] = current
+                            log.info(f"  MARKET #{market_tk['ticket']} continue BE @{market_entry} + trailing")
+                    else:
+                        # Pas de LIMIT → MARKET seul, BE + trailing
+                        self.bridge.modify_sl(market_tk["ticket"], market_entry, "[CAS1 BE]")
+                        market_tk["trail_active"] = True
+                        market_tk["sl_step"] = 1
+                        market_tk["trail_last_price"] = current
+                        log.info(f"  MARKET #{market_tk['ticket']} continue BE @{market_entry} + trailing")
 
             # === CAS 2-a : market_cas2 + limit_cas2 (prix entre zone et TP1) ===
             if not entry.get("_cas2a_handled"):
@@ -1545,22 +1588,36 @@ class TradeManager:
                         lc2_order = o
 
                 if mc2_tk:
-                    mc2_pos = self._get_pos(mc2_tk["ticket"])
-                    if mc2_pos is None:
+                    # Vérifier si TP3 atteint via OHLC
+                    tp3_level = mc2_tk.get("tp3", 0)
+                    if tp3_level > 0 and self._check_tp3_ohlc(symbol, tp3_level, action):
                         entry["_cas2a_handled"] = True
                         market_entry_c2 = mc2_tk.get("entry_price", 0)
-                        log.info(f"CAS 2-a TP3 atteint → market #{mc2_tk['ticket']} fermé")
+                        log.info(f"CAS 2-a TP3 atteint ({tp3_level}) → prix={current}")
+                        
                         if lc2_tk:
+                            # CAS 3-a-2 : LIMIT remplie → fermer MARKET, BE sur LIMIT
                             lpos = self._get_pos(lc2_tk["ticket"])
                             if lpos:
+                                # Fermer le MARKET
+                                mc2_pos = self._get_pos(mc2_tk["ticket"])
+                                if mc2_pos:
+                                    self.bridge.close_position(mc2_tk["ticket"], "C2a-TP3-close-market")
+                                    log.info(f"  MARKET #{mc2_tk['ticket']} fermé @ TP3")
                                 log.info(f"CAS 2-a → 3-a-2 limit remplie → BE @{market_entry_c2} + trail")
                                 self.bridge.modify_sl(lc2_tk["ticket"], market_entry_c2, "[C2a TP3 BE]")
                                 lc2_tk["trail_active"] = True
                                 lc2_tk["sl_step"] = 1
                                 lc2_tk["trail_last_price"] = current
                         elif lc2_order:
+                            # Vérifier si LIMIT tardive remplie
                             lpos = self._resolve_order(lc2_order["order"], symbol)
                             if lpos:
+                                # LIMIT tardive remplie → fermer MARKET, BE sur LIMIT
+                                mc2_pos = self._get_pos(mc2_tk["ticket"])
+                                if mc2_pos:
+                                    self.bridge.close_position(mc2_tk["ticket"], "C2a-TP3-close-market")
+                                    log.info(f"  MARKET #{mc2_tk['ticket']} fermé @ TP3")
                                 log.info(f"CAS 2-a → 3-a-2 limit tardive → BE @{market_entry_c2} + trail")
                                 self.bridge.modify_sl(lpos.ticket, market_entry_c2, "[C2a TP3 BE]")
                                 tk = {"ticket": lpos.ticket, "lot": lc2_order["lot"], "role": "limit_cas2",
@@ -1571,13 +1628,28 @@ class TradeManager:
                                 entry["tickets"].append(tk)
                                 entry["orders"].remove(lc2_order)
                             else:
+                                # LIMIT non remplie → annuler LIMIT, MARKET continue avec BE + trailing
                                 log.info(f"CAS 2-a → 3-a-1 limit non remplie → annulation #{lc2_order['order']}")
                                 self.bridge.cancel_order(lc2_order["order"])
                                 entry["orders"].remove(lc2_order)
+                                # MARKET continue avec BE + trailing
+                                self.bridge.modify_sl(mc2_tk["ticket"], market_entry_c2, "[C2a BE]")
+                                mc2_tk["trail_active"] = True
+                                mc2_tk["sl_step"] = 1
+                                mc2_tk["trail_last_price"] = current
+                                log.info(f"  MARKET #{mc2_tk['ticket']} continue BE @{market_entry_c2} + trailing")
+                        else:
+                            # Pas de LIMIT → MARKET seul, BE + trailing
+                            self.bridge.modify_sl(mc2_tk["ticket"], market_entry_c2, "[C2a BE]")
+                            mc2_tk["trail_active"] = True
+                            mc2_tk["sl_step"] = 1
+                            mc2_tk["trail_last_price"] = current
+                            log.info(f"  MARKET #{mc2_tk['ticket']} continue BE @{market_entry_c2} + trailing")
 
             # === CAS 2-b : limit_1 + limit_2 (prix loin de la zone) ===
             if not entry.get("_cas2_handled"):
                 cas2_tp3_level = 0
+                cas2_symbol = symbol
                 for t in entry["tickets"]:
                     if t.get("tp3"):
                         cas2_tp3_level = t["tp3"]
@@ -1588,12 +1660,10 @@ class TradeManager:
                             cas2_tp3_level = o["tp3"]
                             break
 
+                # Vérifier si TP3 atteint via OHLC
                 cas2_tp3_hit = False
                 if cas2_tp3_level > 0:
-                    if action == "BUY" and current >= cas2_tp3_level:
-                        cas2_tp3_hit = True
-                    elif action == "SELL" and current <= cas2_tp3_level:
-                        cas2_tp3_hit = True
+                    cas2_tp3_hit = self._check_tp3_ohlc(cas2_symbol, cas2_tp3_level, action)
 
                 if cas2_tp3_hit:
                     cas2_limit1_tk = None
@@ -1844,6 +1914,7 @@ async def main():
             log.info(f"  {env_name} : {ch_value}")
     log.info(f" Lot : {LOT_SIZE}")
     log.info(f" Trail SL : {TRAIL_POINTS} pts")
+    log.info(f" Poll interval : {POLL_INTERVAL_SEC}s (OHLC)")
     log.info(f" News filter : {'ON' if NEWS_ENABLED else 'OFF'}")
     log.info(f" Time filter : OFF (désactivé temporairement)")
     if RUNTIME_MINUTES > 0:

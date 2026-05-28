@@ -1,6 +1,6 @@
 # Context.md — TradingBot GZL2
 
-> **Dernière mise à jour :** 2026-05-24 (v6.1)
+> **Dernière mise à jour :** 2026-05-28 (v6.2)
 > **Commande `/maj`** : mettre à jour ce fichier avec les derniers changements du projet.
 
 ## 📋 Résumé du projet
@@ -143,6 +143,13 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 
 ## 📊 Stratégie d'exécution
 
+### Détection TP3 — Vérification OHLC (v6.2)
+Le bot vérifie si le prix a atteint le niveau TP3 via les **bougies OHLC M1** (bougie en cours), pas par vérification directe du prix. Cela garantit qu'aucun passage à TP3 n'est raté, même bref.
+
+- Intervalle de polling configurable via `POLL_INTERVAL_SEC` dans `bot.env` (défaut : 5s)
+- Vérifie le **High** (BUY) ou **Low** (SELL) des 5 dernières bougies M1
+- Utilise `mt5.copy_rates_from_pos(symbol, TIMEFRAME_M1, 0, 5)`
+
 ### Signaux à prix unique (sans zone)
 Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot utilise directement le prix unique (pas de mini-zone ±0.5) :
 
@@ -154,25 +161,30 @@ Quand le signal donne un seul prix (ENTRY: 3240, @ 3240, BUY 3240), le bot utili
 
 La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 
-### CAS 1 : Prix dans la zone d'entrée
+### CAS 1 : Prix dans la zone
 - **MARKET** (50% lot) → TP = tp_final
 - **LIMIT** (50% lot) entre SL et zone → TP = tp_final
-- **TP3 atteint (2-a)** : LIMIT non exécuté → annuler LIMIT, BE @ entrée MARKET + trailing
+- **TP3 atteint (2-a)** : LIMIT non exécuté → annuler LIMIT, MARKET continue avec BE @ entrée MARKET + trailing
 - **TP3 atteint (2-b)** : LIMIT exécuté → fermer MARKET, BE @ entrée MARKET + trailing sur LIMIT
 
 ### CAS 2 : Prix hors zone
 - **Si prix entre zone et TP1** :
   - **MARKET** @ prix actuel (50% lot) → TP = tp_final
   - **LIMIT** @ l'autre limite de zone (50% lot) → TP = tp_final
-  - **TP3 atteint (3-a-1)** : LIMIT non exécuté → annuler LIMIT, BE @ entrée MARKET + trailing
-  - **TP3 atteint (3-a-2)** : LIMIT exécuté → fermer MARKET, BE @ entrée MARKET + trailing sur LIMIT
+  - **TP3 atteint (3-a-1)** : LIMIT non exécutée → annuler LIMIT, MARKET continue avec BE @ entrée MARKET + trailing
+  - **TP3 atteint (3-a-2)** : LIMIT exécutée → fermer MARKET, BE @ entrée MARKET + trailing sur LIMIT
 - **Si prix loin de la zone (au-delà de TP1)** :
   - **LIMIT_1** (50% lot) au bord de la zone → TP = tp_final
   - **LIMIT_2** (50% lot) côté opposé de la zone → TP = tp_final
   - **TP3 atteint (3-b-1)** : aucun rempli → annuler les 2
-  - **TP3 atteint (3-b-2)** : LIMIT_1 remplie, LIMIT_2 non → annuler LIMIT_2, BE @ entrée LIMIT_1 + trailing
+  - **TP3 atteint (3-b-2)** : LIMIT_1 remplie, LIMIT_2 non → annuler LIMIT_2, LIMIT_1 continue avec BE @ entrée LIMIT_1 + trailing
   - **TP3 atteint (3-b-3)** : les 2 remplies → fermer LIMIT_1, BE @ entrée LIMIT_1 + trailing sur LIMIT_2
 - **Scénario D** : SL touché → tout fermé
+
+### Règle générale TP3
+Quand TP3 est atteint :
+- **1 position ouverte + 1 pending** → annuler le pending, la position ouverte continue avec BE + trailing
+- **2 positions ouvertes** → fermer celle qui a atteint son TP, l'autre continue avec BE + trailing
 
 ### TP_TRIGGER (déclencheur BE/trailing)
 - Configurable via workflow input `tp_trigger` (défaut : 3)
@@ -192,6 +204,12 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 - Filtre news Forex Factory (HIGH impact USD/XAU)
 - Filtre horaire désactivé temporairement
 
+### Gestion des fermetures manuelles (v6.2)
+Le bot détecte les fermetures manuelles (pas par TP/SL) :
+- Si PnL positif → log comme TP
+- Si PnL négatif → log comme SL
+- Méthode `_get_close_reason()` dans TradeManager
+
 ## 🗄️ Supabase Schema
 - **sessions** : runtime, channels, lot_size, mode, status
 - **trades** : symbol, action, zone, SL, TPs, result, PnL, durée
@@ -209,6 +227,7 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 - Cleanup .env automatique à la fin
 
 ## 📝 Historique des versions
+- **v6.2** (2026-05-28) : Vérification TP3 via OHLC (bougie en cours), polling configurable POLL_INTERVAL_SEC (défaut 5s), correction CAS 1/2-a (vérifier niveau prix TP3 au lieu de position fermée), correction PU S2 (BE avant trailing), règle pending annulé / ouverte continue BE+trailing
 - **v6.1** (2026-05-24) : Prix unique détecté par le parser (is_single_price flag, pas de mini-zone), commentaire MT5 CHn-PU-Sm, gestion TP3 unifiée tous cas (BE @ entrée, trailing, fermeture manuelle)
 - **v6.0** (2026-05-22) : Parser unifié (fusion gzl2 v5.1 + onee-tech-app), TradeSignal dataclass, FormatProfile + detect_format(), 22 TP + 19 SL patterns, superscript Unicode, 9 canaux TG, signaux prix unique (S1/S2/S3), CAS 2 amélioré (MARKET si prix entre zone et TP1)
 - **v4.6.1** (2026-05-15) : fix PnL 0 pour trades >24h (fenêtre 7j), fix TP/SL logging (DEAL_REASON_TP/SL), fix CHANNEL_NUM_MAP lookup titre canal, SL validation range (patterns 1-4,6), TP Pattern 1 boundary \b, trailing ratio 1:2, cleanup doublon trailing
@@ -230,3 +249,5 @@ La gestion BE/trailing à TP3 est identique aux signaux avec zone.
 - `TP_TRIGGER` est configurable via le workflow (input `tp_trigger`, défaut 3)
 - Le trailing est en ratio 1:2 (TRAIL_POINTS=200, gap 2$ pour 4$ de mouvement), pas en gap fixe
 - **9 canaux TG** supportés (TG_CHANNEL_1 à TG_CHANNEL_9)
+- **POLL_INTERVAL_SEC** configurable dans `bot.env` (défaut 5s) — intervalle de vérification OHLC
+- La vérification TP3 utilise les bougies OHLC M1 (pas le prix direct) pour ne rater aucun passage
