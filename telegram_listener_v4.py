@@ -171,6 +171,11 @@ except ImportError:
     _supa_connected = False
     log.warning("supabase_logger non trouvé — pas de log distant")
 
+# Initialiser le tracker
+if _tracker_available:
+    _tracker = get_tracker(_supa if _supa_connected else None)
+    log.info("[TRACK] Module de tracking initialisé")
+
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(
     logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
@@ -383,6 +388,15 @@ class NewsManager:
 # SIGNAL PARSER — importé depuis signal_parser.py (v5.1)
 # ------------------------------------------------------------------
 from signal_parser import SignalParser, is_spam, TradeSignal, detect_format, FormatProfile
+
+# Tracking module (enrichissement Supabase)
+try:
+    from tracking import get_tracker
+    _tracker = None
+    _tracker_available = True
+except ImportError:
+    _tracker = None
+    _tracker_available = False
 
 
 # =============================================================
@@ -1228,6 +1242,15 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         )
         entry["_supa_trade_id"] = supa_trade_id
 
+    # Tracking enrichi
+    if _tracker and _supa_connected:
+        cas_num = 1 if in_zone else 2
+        signal_type = "PU" if is_single_price else f"CAS{cas_num}"
+        enriched = _tracker.enrich_trade_data(signal, current, LOT_SIZE, sl, tp_final, cas_num)
+        if supa_trade_id:
+            _tracker.update_trade_tracking(supa_trade_id, enriched)
+            _tracker.track_open(supa_trade_id, signal, current, LOT_SIZE, sl, tp_final, signal_type)
+
 
 # =============================================================
 # TRADE MANAGER (v4.2 — async-safe)
@@ -1774,6 +1797,16 @@ class TradeManager:
                         except Exception:
                             duree = 0
                         _supa.log_trade_close(supa_id, result_str, total_pnl, duree)
+                        
+                        # Tracking enrichi
+                        if _tracker:
+                            tracking_data = _tracker.track_close(supa_id, total_pnl, result_str)
+                            if tracking_data:
+                                _tracker.update_trade_tracking(supa_id, {
+                                    "r_multiple": tracking_data["r_multiple"],
+                                    "max_drawdown": tracking_data["max_drawdown"],
+                                    "signal_type": tracking_data["signal_type"],
+                                })
                 with self._lock:
                     if entry in self.active:
                         self.active.remove(entry)
