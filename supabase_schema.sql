@@ -212,6 +212,10 @@ ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trades ENABLE ROW LEVEL SECURITY;
 ALTER TABLE events ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS "Allow all on sessions" ON sessions;
+DROP POLICY IF EXISTS "Allow all on trades" ON trades;
+DROP POLICY IF EXISTS "Allow all on events" ON events;
+
 CREATE POLICY "Allow all on sessions" ON sessions FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all on trades" ON trades FOR ALL USING (true) WITH CHECK (true);
 CREATE POLICY "Allow all on events" ON events FOR ALL USING (true) WITH CHECK (true);
