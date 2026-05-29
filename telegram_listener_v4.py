@@ -1417,6 +1417,7 @@ class TradeManager:
 
             # Resolve pending limit orders → tickets
             still_pending = []
+            limit_filled = False
             for o in entry["orders"]:
                 pos = self._resolve_order(o["order"], symbol)
                 if pos:
@@ -1433,6 +1434,7 @@ class TradeManager:
                         "trail_active": False,
                     }
                     entry["tickets"].append(tk)
+                    limit_filled = True
                     log.info(
                         f"Ordre #{o['order']} rempli → "
                         f"ticket={pos.ticket} @{pos.price_open}"
@@ -1442,6 +1444,21 @@ class TradeManager:
                 else:
                     still_pending.append(o)
             entry["orders"] = still_pending
+
+            # Sync tickets vers Supabase quand une limit est remplie
+            if limit_filled:
+                supa_id = entry.get("_supa_trade_id")
+                if supa_id and _supa_connected and _supa:
+                    try:
+                        current_tickets = [t["ticket"] for t in entry["tickets"]]
+                        _supa._retry_call(
+                            lambda: _supa.client.table("trades")
+                            .update({"tickets": current_tickets})
+                            .eq("id", supa_id).execute()
+                        )
+                        log.info(f"[SUPA] Tickets mis à jour: {current_tickets}")
+                    except Exception as e:
+                        log.warning(f"[SUPA] Erreur update tickets: {e}")
 
             active_tks = [
                 t for t in entry["tickets"] if self._get_pos(t["ticket"])
