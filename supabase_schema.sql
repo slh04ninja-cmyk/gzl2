@@ -1,5 +1,6 @@
 -- =============================================================
--- TradingBot V4 — Schéma Supabase
+-- TradingBot V4 — Schéma Supabase (complet avec migration v2)
+-- Exécuter dans Supabase SQL Editor
 -- =============================================================
 
 CREATE TABLE IF NOT EXISTS sessions (
@@ -35,7 +36,13 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl REAL DEFAULT 0,
     duree_min REAL DEFAULT 0,
     tickets BIGINT[] DEFAULT '{}',
-    notes TEXT
+    notes TEXT,
+    -- Migration v2
+    signal_type TEXT DEFAULT 'UNKNOWN',
+    risk_reward REAL DEFAULT 0,
+    r_multiple REAL DEFAULT 0,
+    max_drawdown REAL DEFAULT 0,
+    tp_hit TEXT
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -53,6 +60,7 @@ CREATE INDEX IF NOT EXISTS idx_trades_result ON trades(result);
 CREATE INDEX IF NOT EXISTS idx_trades_opened ON trades(opened_at DESC);
 CREATE INDEX IF NOT EXISTS idx_events_trade ON events(trade_id);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
+CREATE INDEX IF NOT EXISTS idx_trades_signal_type ON trades(signal_type);
 
 CREATE OR REPLACE VIEW canal_stats AS
 SELECT
@@ -112,6 +120,94 @@ LEFT JOIN trades t ON t.session_id = s.id
 GROUP BY s.id
 ORDER BY s.started_at DESC;
 
+-- =============================================================
+-- Vues enrichies (migration v2)
+-- =============================================================
+
+CREATE OR REPLACE VIEW canal_stats_enriched AS
+SELECT
+    canal,
+    COUNT(*) as total_trades,
+    COUNT(*) FILTER (WHERE result = 'WIN') as wins,
+    COUNT(*) FILTER (WHERE result = 'LOSS') as losses,
+    COUNT(*) FILTER (WHERE result = 'BE') as breakevens,
+    COUNT(*) FILTER (WHERE result = 'OPEN') as still_open,
+    ROUND(SUM(pnl)::numeric, 2) as total_pnl,
+    ROUND(AVG(pnl) FILTER (WHERE result != 'OPEN')::numeric, 2) as avg_pnl,
+    ROUND(
+        CASE
+            WHEN COUNT(*) FILTER (WHERE result IN ('WIN','LOSS','BE')) > 0
+            THEN (COUNT(*) FILTER (WHERE result = 'WIN')::float /
+                  COUNT(*) FILTER (WHERE result IN ('WIN','LOSS','BE')) * 100)
+            ELSE 0
+        END::numeric, 1
+    ) as win_rate,
+    ROUND(
+        CASE
+            WHEN SUM(pnl) FILTER (WHERE pnl < 0) < 0
+            THEN ABS(SUM(pnl) FILTER (WHERE pnl > 0)) /
+                 ABS(SUM(pnl) FILTER (WHERE pnl < 0))
+            ELSE 0
+        END::numeric, 2
+    ) as profit_factor,
+    ROUND(AVG(risk_reward) FILTER (WHERE risk_reward > 0)::numeric, 2) as avg_rr,
+    ROUND(AVG(r_multiple) FILTER (WHERE r_multiple != 0)::numeric, 2) as avg_r_multiple,
+    ROUND(MAX(max_drawdown)::numeric, 2) as max_drawdown,
+    ROUND(MAX(pnl)::numeric, 2) as best_trade,
+    ROUND(MIN(pnl)::numeric, 2) as worst_trade,
+    COUNT(*) FILTER (WHERE signal_type = 'CAS1') as cas1_count,
+    COUNT(*) FILTER (WHERE signal_type = 'CAS2') as cas2_count,
+    COUNT(*) FILTER (WHERE signal_type = 'PU') as pu_count,
+    ROUND(
+        CASE
+            WHEN COUNT(*) FILTER (WHERE signal_type = 'CAS1' AND result IN ('WIN','LOSS','BE')) > 0
+            THEN (COUNT(*) FILTER (WHERE signal_type = 'CAS1' AND result = 'WIN')::float /
+                  COUNT(*) FILTER (WHERE signal_type = 'CAS1' AND result IN ('WIN','LOSS','BE')) * 100)
+            ELSE 0
+        END::numeric, 1
+    ) as cas1_win_rate,
+    ROUND(
+        CASE
+            WHEN COUNT(*) FILTER (WHERE signal_type = 'CAS2' AND result IN ('WIN','LOSS','BE')) > 0
+            THEN (COUNT(*) FILTER (WHERE signal_type = 'CAS2' AND result = 'WIN')::float /
+                  COUNT(*) FILTER (WHERE signal_type = 'CAS2' AND result IN ('WIN','LOSS','BE')) * 100)
+            ELSE 0
+        END::numeric, 1
+    ) as cas2_win_rate,
+    ROUND(
+        CASE
+            WHEN COUNT(*) FILTER (WHERE signal_type = 'PU' AND result IN ('WIN','LOSS','BE')) > 0
+            THEN (COUNT(*) FILTER (WHERE signal_type = 'PU' AND result = 'WIN')::float /
+                  COUNT(*) FILTER (WHERE signal_type = 'PU' AND result IN ('WIN','LOSS','BE')) * 100)
+            ELSE 0
+        END::numeric, 1
+    ) as pu_win_rate
+FROM trades
+WHERE result != 'OPEN'
+GROUP BY canal
+ORDER BY total_pnl DESC;
+
+CREATE OR REPLACE VIEW hourly_stats AS
+SELECT
+    EXTRACT(HOUR FROM opened_at AT TIME ZONE 'UTC') as hour_utc,
+    COUNT(*) as total_trades,
+    COUNT(*) FILTER (WHERE result = 'WIN') as wins,
+    COUNT(*) FILTER (WHERE result = 'LOSS') as losses,
+    ROUND(SUM(pnl)::numeric, 2) as total_pnl,
+    ROUND(
+        CASE
+            WHEN COUNT(*) FILTER (WHERE result IN ('WIN','LOSS','BE')) > 0
+            THEN (COUNT(*) FILTER (WHERE result = 'WIN')::float /
+                  COUNT(*) FILTER (WHERE result IN ('WIN','LOSS','BE')) * 100)
+            ELSE 0
+        END::numeric, 1
+    ) as win_rate
+FROM trades
+WHERE result != 'OPEN'
+GROUP BY EXTRACT(HOUR FROM opened_at AT TIME ZONE 'UTC')
+ORDER BY hour_utc;
+
+-- RLS
 ALTER TABLE sessions ENABLE ROW LEVEL SECURITY;
 ALTER TABLE trades ENABLE ROW LEVEL SECURITY;
 ALTER TABLE events ENABLE ROW LEVEL SECURITY;
