@@ -1296,6 +1296,48 @@ class TradeManager:
                 return True
         return False
 
+    def _check_tp3_by_ohlc(self, entry: dict) -> bool:
+        """Vérifie si TP3 a été atteint via OHLC (quand aucune position n'est ouverte)."""
+        sig = entry["signal"]
+        action = sig["action"]
+        symbol = sig["symbol"]
+
+        # Trouver le niveau TP3 depuis les tickets ou les orders
+        tp3_level = 0
+        for t in entry.get("tickets", []):
+            if t.get("tp3"):
+                tp3_level = t["tp3"]
+                break
+        if not tp3_level:
+            for o in entry.get("orders", []):
+                if o.get("tp3"):
+                    tp3_level = o["tp3"]
+                    break
+        if not tp3_level:
+            return False
+
+        # Vérifier si une position est déjà ouverte (P&L trigger suffit)
+        for t in entry.get("tickets", []):
+            if self._get_pos(t["ticket"]):
+                return False  # laisser _check_pnl_trigger gérer
+
+        sym_info = self.bridge._sym(symbol)
+        if sym_info is None:
+            return False
+
+        rates = mt5.copy_rates_from_pos(sym_info.name, mt5.TIMEFRAME_M1, 0, 5)
+        if rates is None:
+            return False
+
+        for rate in rates:
+            if action == "SELL" and rate["low"] <= tp3_level:
+                log.info(f"OHLC TP3 détecté: low={rate['low']} <= TP3={tp3_level}")
+                return True
+            elif action == "BUY" and rate["high"] >= tp3_level:
+                log.info(f"OHLC TP3 détecté: high={rate['high']} >= TP3={tp3_level}")
+                return True
+        return False
+
     async def _loop_async(self):
         """Boucle async avec asyncio.to_thread pour les appels MT5 bloquants."""
         while not self._stop:
@@ -1663,8 +1705,8 @@ class TradeManager:
 
             # === CAS 2-b : limit_1 + limit_2 (prix loin de la zone) ===
             if not entry.get("_cas2_handled"):
-                # Vérifier si P&L trigger atteint
-                cas2_pnl_hit = self._check_pnl_trigger(entry)
+                # Vérifier si P&L trigger atteint OU TP3 touché via OHLC (pending only)
+                cas2_pnl_hit = self._check_pnl_trigger(entry) or self._check_tp3_by_ohlc(entry)
 
                 if cas2_pnl_hit:
                     cas2_limit1_tk = None
