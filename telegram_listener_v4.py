@@ -1289,17 +1289,29 @@ class TradeManager:
     def _check_pnl_trigger(self, entry: dict) -> bool:
         """Vérifie si une position du trade a atteint le P&L trigger.
         Pour CAS 1/2-a (MARKET+LIMIT): vérifie le MARKET seul.
-        Pour les autres cas: vérifie le premier rempli (individuellement).
+        Pour CAS 2-b (LIMIT+LIMIT): vérifie le premier rempli chronologiquement.
+        Pour les autres: vérifie la position existante.
         """
         has_market = any(
             t.get("role") in ("market_tp3", "market_cas2", "market_single")
             for t in entry.get("tickets", [])
         )
 
+        # CAS 2-b: trouver le premier limit rempli (ordre chronologique dans tickets)
+        if not has_market:
+            for t in entry.get("tickets", []):
+                if t.get("role") in ("limit_1", "limit_2"):
+                    if t.get("trail_active") or t.get("_pnl_handled"):
+                        continue
+                    pos = self._get_pos(t["ticket"])
+                    if pos and pos.profit >= PNL_TRIGGER_USD:
+                        return True
+                    return False  # premier rempli trouvé mais pas encore 5$ → attendre
+
+        # CAS 1/2-a: MARKET seul
         for t in entry.get("tickets", []):
             if t.get("trail_active") or t.get("_pnl_handled"):
                 continue
-            # CAS 1/2-a: ne déclencher que sur le MARKET
             if has_market and t.get("role") not in ("market_tp3", "market_cas2", "market_single"):
                 continue
             pos = self._get_pos(t["ticket"])
