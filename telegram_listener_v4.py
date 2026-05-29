@@ -1287,9 +1287,20 @@ class TradeManager:
             self._task.cancel()
 
     def _check_pnl_trigger(self, entry: dict) -> bool:
-        """Vérifie si une position du trade a atteint le P&L trigger."""
+        """Vérifie si une position du trade a atteint le P&L trigger.
+        Pour CAS 1/2-a (MARKET+LIMIT): vérifie le MARKET seul.
+        Pour CAS 2-b (LIMIT only): vérifie chaque position individuellement.
+        """
+        has_market = any(
+            t.get("role") in ("market_tp3", "market_cas2", "market_single")
+            for t in entry.get("tickets", [])
+        )
+
         for t in entry.get("tickets", []):
             if t.get("trail_active") or t.get("_pnl_handled"):
+                continue
+            # CAS 1/2-a: ne déclencher que sur le MARKET
+            if has_market and t.get("role") not in ("market_tp3", "market_cas2", "market_single"):
                 continue
             pos = self._get_pos(t["ticket"])
             if pos and pos.profit >= PNL_TRIGGER_USD:
