@@ -926,6 +926,8 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     log.info(f"TPs={all_tps} ({len(all_tps)}) | SL={sl}")
     log.info("=" * 55)
 
+    orders, tickets = [], []
+
     # ─────────────────────────────────────────────────────
     # SIGNAL À PRIX UNIQUE (pas de zone)
     # Scénario 1: prix entre entry et TP1 → MARKET
@@ -1022,12 +1024,30 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
         }
         manager.register(entry)
         tracker.log_trade_open(entry)
+
+        # Supabase + tracking (Bug #2)
+        supa_trade_id = None
+        if _supa_connected and _supa:
+            ticket_ids = [t["ticket"] for t in tickets]
+            supa_trade_id = _supa.log_trade_open(
+                signal=signal,
+                entry_price=current,
+                lot_size=LOT_SIZE,
+                tickets=ticket_ids,
+            )
+            entry["_supa_trade_id"] = supa_trade_id
+
+        if _tracker and _supa_connected and supa_trade_id:
+            signal_type = "PU"
+            enriched = _tracker.enrich_trade_data(signal, current, LOT_SIZE, sl, tp_final, 0)
+            _tracker.update_trade_tracking(supa_trade_id, enriched)
+            _tracker.track_open(supa_trade_id, signal, current, LOT_SIZE, sl, tp_final, signal_type)
+
         return
 
     # ─────────────────────────────────────────────────────
     # SIGNAL AVEC ZONE (logique existante CAS 1 / CAS 2)
     # ─────────────────────────────────────────────────────
-    orders, tickets = [], []
 
     if in_zone:
         # ─────────────────────────────────────────────
@@ -1233,6 +1253,7 @@ def execute_signal(signal: dict, bridge: MT5Bridge, manager, tracker):
     manager.register(entry)
     tracker.log_trade_open(entry)
 
+    supa_trade_id = None
     if _supa_connected and _supa:
         ticket_ids = [t["ticket"] for t in tickets]
         supa_trade_id = _supa.log_trade_open(
@@ -1834,22 +1855,24 @@ class TradeManager:
                     price_moved = current - last_price
                     if price_moved >= trigger_step:
                         nsl = pos.sl + trail_step if pos.sl > 0 else current - trail_step
-                        self.bridge.modify_sl(
+                        ok = self.bridge.modify_sl(
                             t["ticket"],
                             round(nsl, d),
                             label="[Trail BUY]",
                         )
-                        t["trail_last_price"] = current
+                        if ok:
+                            t["trail_last_price"] = current
                 else:
                     price_moved = last_price - current
                     if price_moved >= trigger_step:
                         nsl = pos.sl - trail_step if pos.sl > 0 else current + trail_step
-                        self.bridge.modify_sl(
+                        ok = self.bridge.modify_sl(
                             t["ticket"],
                             round(nsl, d),
                             label="[Trail SELL]",
                         )
-                        t["trail_last_price"] = current
+                        if ok:
+                            t["trail_last_price"] = current
 
             # Check if trade fully closed
             active_tks = [
