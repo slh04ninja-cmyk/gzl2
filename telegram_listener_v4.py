@@ -171,7 +171,8 @@ except ImportError:
     _supa_connected = False
     log.warning("supabase_logger non trouvé — pas de log distant")
 
-# Initialiser le tracker
+# Initialiser le tracker (défini plus bas dans le fichier)
+_tracker_available = False  # sera mis à True si l'import réussit (ligne ~396)
 if _tracker_available:
     _tracker = get_tracker(_supa if _supa_connected else None)
     log.info("[TRACK] Module de tracking initialisé")
