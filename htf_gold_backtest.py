@@ -247,19 +247,41 @@ print("✅ Fonction régime définie")
 # ## 4. Données XAUUSD
 
 # %%
-def fetch_gold_data(period="1mo", interval="1m"):
-    """Télécharge les données XAUUSD via yfinance"""
-    # GC=F = Gold Futures, XAUUSD=X n'a pas de M1
+def fetch_gold_data(period_days=30, interval="1m"):
+    """Télécharge les données XAUUSD via yfinance (batch 8 jours pour M1)"""
     ticker = yf.Ticker("GC=F")
-    df = ticker.history(period=period, interval=interval)
     
-    if df.empty:
-        print("⚠️ Pas de données M1 pour GC=F, essai avec 5m...")
-        df = ticker.history(period=period, interval="5m")
+    # yfinance limit: 8 days of M1 data per request
+    if interval == "1m":
+        batch_days = 7
+    else:
+        batch_days = period_days
     
+    all_dfs = []
+    end = datetime.now()
+    start = end - timedelta(days=period_days)
+    
+    current = start
+    while current < end:
+        batch_end = min(current + timedelta(days=batch_days), end)
+        try:
+            df_batch = ticker.history(start=current, end=batch_end, interval=interval)
+            if not df_batch.empty:
+                all_dfs.append(df_batch)
+        except Exception as e:
+            print(f"⚠️ Batch {current.date()} → {batch_end.date()}: {e}")
+        current = batch_end
+    
+    if not all_dfs:
+        print(f"⚠️ Pas de données M1, essai 5m...")
+        return fetch_gold_data(period_days, "5m")
+    
+    df = pd.concat(all_dfs)
+    df = df[~df.index.duplicated(keep='first')]
     df.columns = [c.lower() for c in df.columns]
     df = df[['open', 'high', 'low', 'close', 'volume']].copy()
     df = df.dropna()
+    df = df.sort_index()
     
     print(f"✅ Données: {len(df)} barres | {df.index[0]} → {df.index[-1]}")
     return df
@@ -722,8 +744,8 @@ print("✅ Moteur de backtest défini")
 # ## 6. Lancer le backtest
 
 # %%
-# Télécharger les données
-df = fetch_gold_data(period="1mo", interval="1m")
+# Télécharger les données (30 jours de M1 par défaut)
+df = fetch_gold_data(period_days=30, interval="1m")
 
 # Lancer le backtest
 state, signals = run_backtest(df, params)
