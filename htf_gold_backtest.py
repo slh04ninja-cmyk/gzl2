@@ -919,3 +919,347 @@ if trades:
 # - Le spread et slippage ne sont pas simulés (ajouter un buffer si nécessaire)
 # - Le point_value (0.1) est pour XAUUSDm — ajuster pour ton broker
 # - Pour plus de données, utiliser un feed MT5 ou un autre fournisseur
+
+
+# %% [markdown]
+# ## 10. Optimisation automatique
+# 
+# Teste chaque paramètre avec 5 valeurs (-2 à +2 autour du défaut)
+# et garde celle qui donne le plus de gain.
+
+# %%
+from copy import deepcopy
+
+def get_param_value(p, name):
+    """Récupère la valeur d'un paramètre"""
+    return getattr(p, name)
+
+def set_param_value(p, name, value):
+    """Définit la valeur d'un paramètre"""
+    setattr(p, name, value)
+
+def generate_values(default, is_float=False, is_int=False):
+    """Génère 5 valeurs autour du défaut (-2, -1, 0, +1, +2)"""
+    if is_int:
+        step = 1
+        values = [default - 2, default - 1, default, default + 1, default + 2]
+        return [max(1, int(v)) for v in values]  # Minimum 1
+    else:
+        step = 0.1
+        values = [default - 0.2, default - 0.1, default, default + 0.1, default + 0.2]
+        return [max(0.01, round(v, 2)) for v in values]  # Minimum 0.01
+
+# Paramètres à optimiser (nom, type, borne min, borne max)
+OPTIMIZE_PARAMS = [
+    # SuperTrend
+    ("st1_period", "int", 3, 20),
+    ("st1_multiplier", "float", 0.1, 2.0),
+    ("st2_period", "int", 5, 30),
+    ("st2_multiplier", "float", 0.5, 3.0),
+    
+    # ADX
+    ("adx_period", "int", 5, 30),
+    ("adx_min_level", "float", 10.0, 40.0),
+    
+    # VSP
+    ("vsp_atr_period", "int", 5, 30),
+    ("vsp_spike_multi", "float", 0.5, 3.0),
+    ("vsp_lookback", "int", 3, 20),
+    ("cooldown_bars", "int", 1, 20),
+    
+    # MSB
+    ("msb_swing_bars", "int", 5, 30),
+    
+    # Retournement
+    ("rt_swing_bars", "int", 5, 40),
+    ("rt_lookback", "int", 10, 50),
+    ("rt_buffer_atr", "float", 0.1, 1.0),
+    
+    # SL/TP
+    ("atr_sl_period", "int", 5, 30),
+    ("atr_sl_multi", "float", 0.5, 3.0),
+    ("rr_ratio", "float", 1.0, 4.0),
+    
+    # Lot
+    ("risk_percent", "float", 0.5, 5.0),
+    
+    # Breakeven
+    ("be_trigger_rr", "float", 0.5, 2.0),
+    
+    # Time
+    ("max_minutes", "int", 5, 60),
+    ("session_cooldown_min", "int", 0, 30),
+    
+    # Regime
+    ("regime_adx_strong", "float", 20.0, 50.0),
+    ("regime_adx_weak", "float", 15.0, 35.0),
+    ("regime_weak_risk_factor", "float", 0.2, 1.0),
+    
+    # Circuit Breaker
+    ("cb_max_drawdown_pct", "float", 2.0, 10.0),
+    ("cb_loss_streak_limit", "int", 3, 15),
+]
+
+def run_optimization(df, base_params, optimize_params):
+    """Exécute l'optimisation paramètre par paramètre"""
+    print("=" * 70)
+    print("🔬 OPTIMISATION AUTOMATIQUE — HTF Gold EA v4.3")
+    print("=" * 70)
+    print(f"  Paramètres à optimiser: {len(optimize_params)}")
+    print(f"  Valeurs testées par param: 5 (-2 à +2)")
+    print(f"  Total backtests: {len(optimize_params) * 5}")
+    print("=" * 70)
+    
+    best_params = deepcopy(base_params)
+    results = []
+    
+    for idx, (param_name, param_type, min_val, max_val) in enumerate(optimize_params):
+        default_val = get_param_value(best_params, param_name)
+        
+        # Générer les valeurs à tester
+        if param_type == "int":
+            values = [default_val - 2, default_val - 1, default_val, default_val + 1, default_val + 2]
+            values = [max(min_val, min(max_val, int(v))) for v in values]
+        else:
+            values = [default_val - 0.2, default_val - 0.1, default_val, default_val + 0.1, default_val + 0.2]
+            values = [max(min_val, min(max_val, round(v, 2))) for v in values]
+        
+        # Dédupliquer et trier
+        values = sorted(set(values))
+        
+        print(f"\n[{idx+1}/{len(optimize_params)}] {param_name} (défaut={default_val})")
+        print(f"  Test: {values}")
+        
+        best_val = default_val
+        best_pnl = -float('inf')
+        best_trades = 0
+        
+        for val in values:
+            # Créer une copie avec le paramètre modifié
+            test_params = deepcopy(best_params)
+            set_param_value(test_params, param_name, val)
+            
+            try:
+                # Exécuter le backtest
+                state, signals = run_backtest(df, test_params)
+                
+                # Calculer le P&L total
+                total_pnl = sum(t.profit for t in state.closed_trades)
+                num_trades = len(state.closed_trades)
+                
+                # Critère: P&L total (avec bonus pour plus de trades)
+                score = total_pnl
+                
+                status = "✓" if score > best_pnl else " "
+                print(f"    {status} {param_name}={val} → P&L={total_pnl:+.2f}$ | Trades={num_trades}")
+                
+                if score > best_pnl:
+                    best_pnl = score
+                    best_val = val
+                    best_trades = num_trades
+                    
+            except Exception as e:
+                print(f"    ✗ {param_name}={val} → Erreur: {str(e)[:50]}")
+        
+        # Appliquer la meilleure valeur
+        if best_val != default_val:
+            improvement = best_pnl - sum(t.profit for t in run_backtest(df, best_params)[0].closed_trades) if best_pnl > -float('inf') else 0
+            set_param_value(best_params, param_name, best_val)
+            print(f"  → OPTIMISÉ: {param_name}={default_val} → {best_val} (P&L: {best_pnl:+.2f}$)")
+            results.append({
+                'param': param_name,
+                'old': default_val,
+                'new': best_val,
+                'pnl': best_pnl,
+                'trades': best_trades,
+                'improved': True
+            })
+        else:
+            print(f"  → Inchangé: {param_name}={default_val}")
+            results.append({
+                'param': param_name,
+                'old': default_val,
+                'new': best_val,
+                'pnl': best_pnl,
+                'trades': best_trades,
+                'improved': False
+            })
+    
+    return best_params, results
+
+# %% [markdown]
+# ## 11. Lancer l'optimisation
+
+# %%
+# Lancer l'optimisation
+best_params, opt_results = run_optimization(df, params, OPTIMIZE_PARAMS)
+
+# %% [markdown]
+# ## 12. Résultats de l'optimisation
+
+# %%
+def print_optimization_results(results, best_params):
+    """Affiche les résultats de l'optimisation"""
+    improved = [r for r in results if r['improved']]
+    
+    print("=" * 70)
+    print("📊 RÉSULTATS DE L'OPTIMISATION")
+    print("=" * 70)
+    
+    if improved:
+        print(f"\n✅ {len(improved)} paramètres optimisés:\n")
+        for r in improved:
+            print(f"  • {r['param']}: {r['old']} → {r['new']} (P&L: {r['pnl']:+.2f}$)")
+    else:
+        print("\n⚠️ Aucun paramètre amélioré")
+    
+    print("\n" + "=" * 70)
+    print("📋 PARAMÈTRES OPTIMISÉS FINAUX:")
+    print("=" * 70)
+    
+    # Afficher les paramètres modifiés
+    for r in results:
+        if r['improved']:
+            print(f"  {r['param']} = {r['new']}")
+    
+    # Sauvegarder les paramètres optimisés
+    import json
+    optimized_dict = {}
+    for r in results:
+        optimized_dict[r['param']] = r['new']
+    
+    with open('optimized_params.json', 'w') as f:
+        json.dump(optimized_dict, f, indent=2)
+    
+    print("\n✅ Paramètres sauvegardés: optimized_params.json")
+    print("=" * 70)
+    
+    return optimized_dict
+
+opt_dict = print_optimization_results(opt_results, best_params)
+
+# %% [markdown]
+# ## 13. Backtest final avec paramètres optimisés
+
+# %%
+# Exécuter le backtest final avec les paramètres optimisés
+print("\n🚀 BACKTEST FINAL avec paramètres optimisés...")
+state_opt, signals_opt = run_backtest(df, best_params)
+
+# Afficher les résultats
+trades_opt = print_results(state_opt, best_params)
+
+if trades_opt:
+    plot_results(state_opt, df, trades_opt)
+    
+    # Comparaison
+    print("\n" + "=" * 70)
+    print("📈 COMPARAISON AVANT / APRÈS OPTIMISATION")
+    print("=" * 70)
+    
+    # Backtest original
+    state_orig, _ = run_backtest(df, params)
+    orig_pnl = sum(t.profit for t in state_orig.closed_trades)
+    opt_pnl = sum(t.profit for t in state_opt.closed_trades)
+    
+    print(f"  P&L original:    {orig_pnl:+.2f}$")
+    print(f"  P&L optimisé:    {opt_pnl:+.2f}$")
+    print(f"  Amélioration:    {opt_pnl - orig_pnl:+.2f}$ ({(opt_pnl - orig_pnl)/abs(orig_pnl)*100:+.1f}%)" if orig_pnl != 0 else "")
+    print("=" * 70)
+
+# %% [markdown]
+# ## 14. Export des paramètres optimisés
+
+# %%
+# Générer le fichier .set pour MT5
+def generate_set_file(best_params, opt_results):
+    """Génère un fichier .set MT5 avec les paramètres optimisés"""
+    lines = []
+    lines.append("; HTF_Gold_EA_v4.3 — Paramètres optimisés par backtest Python")
+    lines.append(f"; Date: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    lines.append(";")
+    
+    # Mapping Python → MQL5
+    param_mapping = {
+        "st1_period": "InpST1_Period",
+        "st1_multiplier": "InpST1_Multiplier",
+        "st2_period": "InpST2_Period",
+        "st2_multiplier": "InpST2_Multiplier",
+        "adx_period": "InpADX_Period",
+        "adx_min_level": "InpADX_MinLevel",
+        "vsp_atr_period": "InpVSP_ATR_Period",
+        "vsp_spike_multi": "InpVSP_Spike_Multi",
+        "vsp_lookback": "InpVSP_LookBack",
+        "cooldown_bars": "InpCooldownBars",
+        "msb_swing_bars": "InpMSB_SwingBars",
+        "rt_swing_bars": "InpRT_SwingBars",
+        "rt_lookback": "InpRT_LookBack",
+        "rt_buffer_atr": "InpRT_Buffer_ATR",
+        "atr_sl_period": "InpATR_SL_Period",
+        "atr_sl_multi": "InpATR_SL_Multi",
+        "rr_ratio": "InpRR_Ratio",
+        "risk_percent": "InpRiskPercent",
+        "be_trigger_rr": "InpBE_Trigger_RR",
+        "max_minutes": "InpMaxMinutes",
+        "session_cooldown_min": "InpSessionCooldownMin",
+        "regime_adx_strong": "InpRegime_ADXStrong",
+        "regime_adx_weak": "InpRegime_ADXWeak",
+        "regime_weak_risk_factor": "InpRegime_WeakRiskFactor",
+        "cb_max_drawdown_pct": "InpCB_MaxDrawdownPct",
+        "cb_loss_streak_limit": "InpCB_LossStreakLimit",
+    }
+    
+    for py_name, mql_name in param_mapping.items():
+        val = getattr(best_params, py_name)
+        # Check if optimized
+        was_opt = any(r['param'] == py_name and r['improved'] for r in opt_results)
+        marker = " ; OPTIMIZED" if was_opt else ""
+        lines.append(f"{mql_name}={val}{marker}")
+    
+    # Add non-optimized params with defaults
+    lines.append("\n; === Non optimisés (valeurs par défaut) ===")
+    lines.append("InpSymbol=")
+    lines.append("InpBiasTFMinutes=60")
+    lines.append("InpUseADX=true")
+    lines.append("InpUseCooldown=true")
+    lines.append("InpUseMSB=true")
+    lines.append("InpMSB_BreakType=1")
+    lines.append("InpMSB_Timing=0")
+    lines.append("InpUseRetournement=true")
+    lines.append("InpUseRegime=true")
+    lines.append("InpUseCircuitBreaker=true")
+    lines.append("InpSLTP_Mode=0")
+    lines.append("InpSL_Points=5000")
+    lines.append("InpTP_Points=7500")
+    lines.append("InpLotMode=1")
+    lines.append("InpLotSize=0.01")
+    lines.append("InpLotMin=0.01")
+    lines.append("InpLotMax=1.00")
+    lines.append("InpUseAdaptiveRisk=true")
+    lines.append("InpAR_LossThreshold=4")
+    lines.append("InpAR_ReduceFactor=0.25")
+    lines.append("InpAR_MaxBoost=3.0")
+    lines.append("InpUseBreakeven=true")
+    lines.append("InpMaxTrades=3")
+    lines.append("InpMagicNumber=202602")
+    lines.append("InpSlippage=10")
+    lines.append("InpUseTimeClose=true")
+    lines.append("InpUseTimeFilter=true")
+    lines.append("InpUseWindow1=true")
+    lines.append("InpW1_Start=7")
+    lines.append("InpW1_End=12")
+    lines.append("InpUseWindow2=true")
+    lines.append("InpW2_Start=14")
+    lines.append("InpW2_End=20")
+    
+    return "\n".join(lines)
+
+set_content = generate_set_file(best_params, opt_results)
+
+with open('HTF_Gold_EA_v4.3_optimized.set', 'w') as f:
+    f.write(set_content)
+
+print("✅ Fichier .set optimisé sauvegardé: HTF_Gold_EA_v4.3_optimized.set")
+print("\nPour utiliser dans MT5:")
+print("1. Copie le fichier dans MQL5/Presets/")
+print("2. Strategy Tester → Inputs → Load → HTF_Gold_EA_v4.3_optimized.set")
