@@ -378,15 +378,19 @@ def run_backtest(df, params):
             continue
         h1_time = h1_time[-1]
         
-        # Skip weekends / gaps
+        # Track equity (realized + unrealized P&L)
         current_equity = state.capital
         for t in state.open_trades:
             current_price = df['close'].iloc[i]
             if t.direction == 1:
-                current_equity += (current_price - t.entry_price) / t.sl_dist * abs(t.sl_dist) * t.lot * p.point_value * 10
+                current_equity += (current_price - t.entry_price) * t.lot  # XAUUSDm: 1 lot = 1$/point
             else:
-                current_equity += (t.entry_price - current_price) / t.sl_dist * abs(t.sl_dist) * t.lot * p.point_value * 10
+                current_equity += (t.entry_price - current_price) * t.lot
         state.equity_curve.append(current_equity)
+        
+        # Update peak equity for circuit breaker
+        if current_equity > state.peak_equity:
+            state.peak_equity = current_equity
         
         # === Gestion des trades ouverts (BE, Time Close, SL/TP) ===
         trades_to_close = []
@@ -431,10 +435,11 @@ def run_backtest(df, params):
         
         # Close trades
         for t, exit_price, reason in trades_to_close:
+            # XAUUSDm: 1 lot = 1$ per 1$ price move
             if t.direction == 1:
-                pnl = (exit_price - t.entry_price) * t.lot * p.point_value * 10
+                pnl = (exit_price - t.entry_price) * t.lot
             else:
-                pnl = (t.entry_price - exit_price) * t.lot * p.point_value * 10
+                pnl = (t.entry_price - exit_price) * t.lot
             
             t.exit_time = bar_time
             t.exit_price = exit_price
@@ -466,13 +471,13 @@ def run_backtest(df, params):
                     continue
                 else:
                     state.cb_active = False
-                    state.peak_equity = state.capital
+                    state.peak_equity = current_equity  # Reset to current equity
                     state.cb_consec_losses = 0
             
-            # Check drawdown
+            # Check drawdown using current equity (including unrealized P&L)
             dd_pct = 0
             if state.peak_equity > 0:
-                dd_pct = ((state.peak_equity - state.capital) / state.peak_equity) * 100
+                dd_pct = ((state.peak_equity - current_equity) / state.peak_equity) * 100
             
             if dd_pct >= p.cb_max_drawdown_pct:
                 state.cb_active = True
@@ -660,22 +665,27 @@ def run_backtest(df, params):
             if pd.isna(atr_sl) or atr_sl <= 0:
                 continue
             sl_dist = atr_sl * p.atr_sl_multi
+            # Minimum SL: 3$ for gold (avoid noise stops)
+            min_sl = 3.0
+            if sl_dist < min_sl:
+                sl_dist = min_sl
             tp_dist = sl_dist * p.rr_ratio
         else:  # Points
             sl_dist = p.sl_points * df['close'].iloc[i] * 0.0001  # approx
             tp_dist = p.tp_points * df['close'].iloc[i] * 0.0001
         
         # === Calcul lot ===
+        # XAUUSDm: 1 lot = 1$ per 1$ price move
         if p.lot_mode == 0:
             lot = p.lot_size
         else:
             adaptive_mult = state.risk_mult if p.use_adaptive_risk else 1.0
             effective_risk_pct = p.risk_percent * adaptive_mult * effective_risk
             risk_money = state.capital * (effective_risk_pct / 100.0)
-            sl_in_points = sl_dist / (df['close'].iloc[i] * 0.0001)  # approx
-            if sl_in_points <= 0:
+            if sl_dist <= 0:
                 continue
-            lot = risk_money / (sl_in_points * p.point_value)
+            # lot = risk_money / sl_dist (for XAUUSDm where 1 lot = 1$/point)
+            lot = risk_money / sl_dist
             lot = max(p.lot_min, min(p.lot_max, round(lot, 2)))
         
         # === Mise à jour risque adaptatif ===
@@ -725,9 +735,9 @@ def run_backtest(df, params):
     for t in state.open_trades:
         exit_price = df['close'].iloc[-1]
         if t.direction == 1:
-            pnl = (exit_price - t.entry_price) * t.lot * p.point_value * 10
+            pnl = (exit_price - t.entry_price) * t.lot
         else:
-            pnl = (t.entry_price - exit_price) * t.lot * p.point_value * 10
+            pnl = (t.entry_price - exit_price) * t.lot
         t.exit_time = df.index[-1]
         t.exit_price = exit_price
         t.exit_reason = "END"
