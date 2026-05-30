@@ -1,0 +1,110 @@
+; HTF_Gold_EA_v4.3 — Backtest .set
+; Generated from v3.4.final (common params) + v4.3 defaults (new params)
+; Date: 2026-05-30
+;
+; === SYMBOL ===
+InpSymbol=
+;
+; === TIMEFRAME BIAIS (minutes) ===
+InpBiasTFMinutes=60
+;
+; === FILTRE SUPERTREND BIAIS ===
+InpST1_Period=7
+InpST1_Multiplier=0.4
+InpST2_Period=11
+InpST2_Multiplier=1.2
+;
+; === FILTRE ADX BIAIS ===
+InpUseADX=true
+InpADX_Period=12
+InpADX_MinLevel=23
+;
+; === SL MINIMUM SPREAD ===
+InpUseSpreadSL=false
+InpSpread_Buffer=50
+;
+; === COUCHE 1 : VELOCITY SPIKE (VSP) ===
+InpVSP_ATR_Period=16
+InpVSP_Spike_Multi=1.6
+InpVSP_NeedConfirm=true
+InpVSP_LookBack=7
+InpUseCooldown=true
+InpCooldownBars=5
+;
+; === COUCHE 2 : MICRO STRUCTURE BREAK (MSB) ===
+InpUseMSB=true
+InpMSB_SwingBars=16
+InpMSB_BreakType=1
+InpMSB_Timing=0
+;
+; === FILTRE RETOURNEMENT ===
+InpUseRetournement=true
+InpRT_SwingBars=20
+InpRT_LookBack=30
+InpRT_Buffer_ATR=0.3
+;
+; === v4.3 : FILTRE RÉGIME DE MARCHÉ ===
+InpUseRegime=true
+InpRegime_ADXPeriod=14
+InpRegime_ATRPeriod=14
+InpRegime_ATRWindow=20
+InpRegime_ADXStrong=30.0
+InpRegime_ADXWeak=23.0
+InpRegime_ADXChoppy=18.0
+InpRegime_VolRatioMax=2.0
+InpRegime_EfficiencyStrong=0.5
+InpRegime_EfficiencyWeak=0.3
+InpRegime_EfficiencyChoppy=0.2
+InpRegime_EffLookback=20
+InpRegime_WeakRiskFactor=0.5
+;
+; === v4.3 : CIRCUIT BREAKER DRAWDOWN ===
+InpUseCircuitBreaker=true
+InpCB_MaxDrawdownPct=5.0
+InpCB_CooldownMinutes=120
+InpCB_LossStreakLimit=6
+InpCB_AlertOnly=false
+;
+; === MODE SL/TP ===
+InpSLTP_Mode=0
+InpATR_SL_Period=15
+InpATR_SL_Multi=1.5
+InpRR_Ratio=2.1
+InpSL_Points=5000
+InpTP_Points=7500
+;
+; === GESTION DU LOT ===
+InpLotMode=1
+InpLotSize=0.01
+InpRiskPercent=1.0
+InpLotMin=0.01
+InpLotMax=1.00
+;
+; === RISQUE ADAPTATIF ===
+InpUseAdaptiveRisk=true
+InpAR_LossThreshold=4
+InpAR_ReduceFactor=0.25
+InpAR_MaxBoost=3.0
+;
+; === BREAKEVEN ===
+InpUseBreakeven=true
+InpBE_Trigger_RR=1.4
+;
+; === TRADE MANAGEMENT ===
+InpMaxTrades=3
+InpMagicNumber=202602
+InpSlippage=10
+;
+; === FERMETURE PAR TEMPS ===
+InpUseTimeClose=true
+InpMaxMinutes=24
+;
+; === FILTRE HORAIRE ===
+InpUseTimeFilter=true
+InpUseWindow1=true
+InpW1_Start=7
+InpW1_End=12
+InpUseWindow2=true
+InpW2_Start=14
+InpW2_End=20
+InpSessionCooldownMin=15
